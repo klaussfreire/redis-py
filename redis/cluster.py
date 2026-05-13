@@ -2264,32 +2264,37 @@ class NodesManager:
         if read_from_replicas is True and load_balancing_strategy is None:
             load_balancing_strategy = LoadBalancingStrategy.ROUND_ROBIN
 
-        with self._lock:
-            if self.slots_cache.get(slot) is None or len(self.slots_cache[slot]) == 0:
-                raise SlotNotCoveredError(
-                    f'Slot "{slot}" not covered by the cluster. '
-                    + f'"require_full_coverage={self._require_full_coverage}"'
-                )
+        # slot-infos are immutable (it's mutable, but never mutated,
+        # only replaced) so after getting a reference to the slot info,
+        # we can safely operate on it without lock
+        slots_cache = self.slots_cache
+        slot_info = slots_cache.get(slot)
 
-            if len(self.slots_cache[slot]) > 1 and load_balancing_strategy:
-                # get the server index using the strategy defined in load_balancing_strategy
-                primary_name = self.slots_cache[slot][0].name
-                node_idx = self.read_load_balancer.get_server_index(
-                    primary_name, len(self.slots_cache[slot]), load_balancing_strategy
-                )
-            elif (
-                server_type is None
-                or server_type == PRIMARY
-                or len(self.slots_cache[slot]) == 1
-            ):
-                # return a primary
-                node_idx = 0
-            else:
-                # return a replica
-                # randomly choose one of the replicas
-                node_idx = random.randint(1, len(self.slots_cache[slot]) - 1)
+        if slot_info is None or len(slot_info) == 0:
+            raise SlotNotCoveredError(
+                f'Slot "{slot}" not covered by the cluster. '
+                + f'"require_full_coverage={self._require_full_coverage}"'
+            )
 
-            return self.slots_cache[slot][node_idx]
+        if len(slot_info) > 1 and load_balancing_strategy:
+            # get the server index using the strategy defined in load_balancing_strategy
+            primary_name = slot_info[0].name
+            node_idx = self.read_load_balancer.get_server_index(
+                primary_name, len(slot_info), load_balancing_strategy
+            )
+        elif (
+            server_type is None
+            or server_type == PRIMARY
+            or len(slot_info) == 1
+        ):
+            # return a primary
+            node_idx = 0
+        else:
+            # return a replica
+            # randomly choose one of the replicas
+            node_idx = random.randint(1, len(slot_info) - 1)
+
+        return slot_info[node_idx]
 
     def get_nodes_by_server_type(self, server_type: Literal["primary", "replica"]):
         """
