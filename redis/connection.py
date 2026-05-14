@@ -107,6 +107,10 @@ SYM_STAR = b"*"
 SYM_DOLLAR = b"$"
 SYM_CRLF = b"\r\n"
 SYM_EMPTY = b""
+SYM_SPACE = b" "
+BYTE_SPACE = SYM_SPACE[0]
+
+CAN_CORK = hasattr(socket, "TCP_CORK")
 
 DefaultParser: Type[Union[_RESP2Parser, _RESP3Parser, _HiredisParser]]
 if HIREDIS_AVAILABLE:
@@ -118,19 +122,16 @@ else:
 class HiredisRespSerializer:
     def pack(self, *args: List):
         """Pack a series of arguments into the Redis protocol"""
-        output = []
-
-        if isinstance(args[0], str):
-            args = tuple(args[0].encode().split()) + args[1:]
-        elif b" " in args[0]:
-            args = tuple(args[0].split()) + args[1:]
+        arg0 = args[0]
+        if isinstance(arg0, str):
+            args = tuple(arg0.encode().split()) + args[1:]
+        elif BYTE_SPACE in arg0:
+            args = tuple(arg0.split()) + args[1:]
         try:
-            output.append(hiredis.pack_command(args))
+            return [hiredis.pack_command(args)]
         except TypeError:
             _, value, traceback = sys.exc_info()
             raise DataError(value).with_traceback(traceback)
-
-        return output
 
 
 class PythonRespSerializer:
@@ -146,10 +147,11 @@ class PythonRespSerializer:
         # arguments to be sent separately, so split the first argument
         # manually. These arguments should be bytestrings so that they are
         # not encoded.
-        if isinstance(args[0], str):
-            args = tuple(args[0].encode().split()) + args[1:]
-        elif b" " in args[0]:
-            args = tuple(args[0].split()) + args[1:]
+        arg0 = args[0]
+        if isinstance(arg0, str):
+            args = tuple(arg0.encode().split()) + args[1:]
+        elif BYTE_SPACE in arg0:
+            args = tuple(arg0.split()) + args[1:]
 
         buff = SYM_EMPTY.join((SYM_STAR, str(len(args)).encode(), SYM_CRLF))
 
@@ -1295,10 +1297,18 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         if check_health:
             self.check_health()
         try:
+            sock = self._sock
             if isinstance(command, str):
                 command = [command]
+                cork = False
+            else:
+                cork = CAN_CORK and len(command) > 1
+            if cork:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, True)
             for item in command:
-                self._sock.sendall(item)
+                sock.sendall(item)
+            if cork:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_CORK, False)
         except socket.timeout:
             self.disconnect()
             raise TimeoutError("Timeout writing to socket")
