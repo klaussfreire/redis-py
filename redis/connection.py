@@ -1315,6 +1315,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                         flags = socket.MSG_MORE
                     sent = sock.sendmsg(islice(command, msgblock), (), flags)
                     lastblock = ncommand - msgblock
+                    lastpos = ncommand - 1
                     for pos, item in enumerate(command):
                         itemlen = len(item)
                         if sent >= itemlen:
@@ -1333,7 +1334,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                             # it's really big where sendall is more efficient
                             if not isinstance(item, memoryview):
                                 item = memoryview(item)
-                            if pos >= ncommand:
+                            if pos >= lastpos:
                                 flags = 0
                             item = item[sent:]
                             sock.sendall(item, flags)
