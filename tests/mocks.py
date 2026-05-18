@@ -23,7 +23,7 @@ class MockSocket:
         if (self.counter % self.interrupt_every) == 0:
             raise self.TestError()
 
-    def recv(self, bufsize):
+    def recv(self, bufsize, flags=0):
         self.tick()
         bufsize = min(5, bufsize)  # truncate the read size
         result = self.data[self.pos : self.pos + bufsize]
