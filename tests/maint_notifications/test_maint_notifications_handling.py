@@ -286,7 +286,7 @@ class MockSocket:
         """Simulate sending all data to Redis."""
         return self.send(data)
 
-    def recv(self, bufsize):
+    def recv(self, bufsize, flags=0):
         """Simulate receiving data from Redis."""
         if self.closed:
             raise ConnectionError("Socket is closed")
