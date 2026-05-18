@@ -161,7 +161,7 @@ class _RESPBase(BaseParser):
 
     def read_from_socket(self, *p, **kw):
         if self._buffer is not None:
-            return self._buffer.read(*p, **kw)
+            return self._buffer.read_from_socket(*p, **kw)
         else:
             return False
 
