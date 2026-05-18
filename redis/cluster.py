@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import copy
 from enum import Enum
-from itertools import chain, zip_longest
+from itertools import chain, cycle
 from types import MethodType
 from typing import (
     TYPE_CHECKING,
@@ -4180,12 +4180,22 @@ class PipelineStrategy(AbstractStrategy):
             # Start timing for observability
             start_time = time.monotonic()
 
-            node_commands = nodes.values()
-            writers = [n.cowrite() for n in node_commands]
-            for _ in zip_longest(*writers):
-                pass
+            writers = [[iter(n.cowrite())] for n in nodes.values()]
+            while writers:
+                writers_cycle = iter(cycle(writers))
+                for wgencell in writers_cycle:
+                    wgen = wgencell[0]
+                    if wgen is None:
+                        # clean up writers cycle
+                        break
+                    try:
+                        _ = next(wgen)
+                    except StopIteration:
+                        nodes_written += 1
+                        wgencell[0] = None
+                writers = [wgencell for wgencell in writers if wgencell[0] is not None]
 
-            for n in node_commands:
+            for n in nodes.values():
                 n.read()
 
                 # Find the first error in this node's commands, if any
