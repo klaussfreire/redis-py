@@ -65,7 +65,7 @@ class MockSocket:
 
             raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
 
-    def recv_into(self, buffer, nbytes=0):
+    def recv_into(self, buffer, nbytes=0, flags=0):
         """
         Receive data from Redis and write it into the provided buffer.
         Returns the number of bytes written.
