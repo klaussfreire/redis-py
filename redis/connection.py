@@ -1309,67 +1309,71 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             self.check_health()
         try:
             sock = self._sock
-            if isinstance(command, str):
+            if isinstance(command, (str, bytes)):
                 command = [command]
-                ncommand = 1
-            else:
+                ncommand == 1
+            elif isinstance(command, list):
                 ncommand = len(command)
-            if ncommand:
-                msgblock = min(maxblock, SC_IOV_MAX)
-                if msgblock and ncommand > 4:
-                    # use iovec for lower overhead on large pipelines
-                    if msgblock >= ncommand:
+            else:
+                ncommand = None
+            if ncommand is None or ncommand > 4:
+                # Send in blocks of up to blocksz buffers using sendmsg
+                blocksz = min(maxblock, SC_IOV_MAX)
+                icommand = iter(command)
+                block = []
+                flags = socket.MSG_MORE
+                while True:
+                    blocklen = len(block)
+                    if blocklen < blocksz:
+                        block.extend(islice(icommand, blocksz - len(block)))
+                        blocklen = len(block)
+                    if blocklen == 0:
+                        break
+                    elif blocklen < blocksz:
+                        # if the block is smaller than the block size, it's the last block
+                        # so we don't need to set MSG_MORE
                         flags = 0
-                    else:
-                        flags = socket.MSG_MORE
-                    sent = sock.sendmsg(command[:msgblock], (), flags)
-                    lastblock = ncommand - msgblock
-                    lastpos = ncommand - 1
+
+                    sent = sock.sendmsg(block, (), flags)
                     yield
-                    for pos, item in enumerate(command):
+                    for pos, item in enumerate(block):
                         itemlen = len(item)
                         if sent >= itemlen:
                             sent -= itemlen
                             continue
-                        elif sent == 0:
-                            # send another block
-                            if pos >= lastblock:
-                                flags = 0
-                            sent = sock.sendmsg(command[pos : pos + msgblock], (), flags)
-                            yield
-                            if sent >= itemlen:
-                                sent -= itemlen
-                                continue
-                        if sent and sent < itemlen:
+
+                        if sent > 0:
                             # partial send, finish the buffer with sendall in case
                             # it's really big where sendall is more efficient
                             if not isinstance(item, memoryview):
                                 item = memoryview(item)
-                            if pos >= lastpos:
-                                flags = 0
                             item = item[sent:]
-                            sock.sendall(item, flags)
-                            sent = 0
-                            yield
-                    if flags:
-                        # Un-cork if we corked the last block
-                        sock.send(b"")
-                else:
-                    # regular corked sendall
-                    # length could be inaccurate so don't count on it
-                    # split along ncommand - 1 in a way that it works
-                    # whether it's the true last command or not
-                    flags = socket.MSG_MORE
-                    icommand = iter(command)
-                    for item in islice(icommand, ncommand - 1):
-                        sock.sendall(item, flags)
-                        yield
-                    for item in icommand:
-                        flags = 0
-                        sock.sendall(item)
-                    if flags:
-                        # Un-cork if we corked the last item
-                        sock.send(b"")
+                            del block[:pos]
+                            block[0] = item
+                        else:
+                            del block[:pos + 1]
+                        break
+                    else:
+                        del block[:]
+                if flags:
+                    # Un-cork if we corked the last block
+                    sock.send(b"")
+            elif ncommand > 0:
+                # regular corked sendall
+                # length could be inaccurate so don't count on it
+                # split along ncommand - 1 in a way that it works
+                # whether it's the true last command or not
+                flags = socket.MSG_MORE
+                icommand = iter(command)
+                for item in islice(icommand, ncommand - 1):
+                    sock.sendall(item, flags)
+                    yield
+                for item in icommand:
+                    flags = 0
+                    sock.sendall(item)
+                if flags:
+                    # Un-cork if we corked the last item
+                    sock.send(b"")
         except socket.timeout:
             self.disconnect()
             raise TimeoutError("Timeout writing to socket")

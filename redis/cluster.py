@@ -92,7 +92,6 @@ from redis.utils import (
     safe_str,
     str_if_bytes,
     truncate_text,
-    LazyList,
 )
 
 logger = logging.getLogger(__name__)
@@ -3730,10 +3729,7 @@ class NodeCommands:
         # send all the commands and catch connection and timeout errors.
         try:
             yield from connection.cosend_packed_command(
-                LazyList(
-                    connection.gen_packed_commands(c.args for c in commands),
-                    length=len(commands),
-                )
+                connection.gen_packed_commands(c.args for c in commands),
             )
         except (ConnectionError, TimeoutError) as e:
             for c in commands:
