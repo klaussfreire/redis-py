@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import copy
 from enum import Enum
-from itertools import chain
+from itertools import chain, zip_longest
 from types import MethodType
 from typing import (
     TYPE_CHECKING,
@@ -92,6 +92,7 @@ from redis.utils import (
     safe_str,
     str_if_bytes,
     truncate_text,
+    LazyList,
 )
 
 logger = logging.getLogger(__name__)
@@ -3710,6 +3711,10 @@ class NodeCommands:
         self.commands.append(c)
 
     def write(self):
+        for _ in self.cowrite():
+            pass
+
+    def cowrite(self):
         """
         Code borrowed from Redis so it can be fixed
         """
@@ -3724,8 +3729,11 @@ class NodeCommands:
         # build up all commands into a single request to increase network perf
         # send all the commands and catch connection and timeout errors.
         try:
-            connection.send_packed_command(
-                connection.pack_commands([c.args for c in commands])
+            yield from connection.cosend_packed_command(
+                LazyList(
+                    connection.gen_packed_commands(c.args for c in commands),
+                    length=len(commands),
+                )
             )
         except (ConnectionError, TimeoutError) as e:
             for c in commands:
@@ -4177,9 +4185,9 @@ class PipelineStrategy(AbstractStrategy):
             start_time = time.monotonic()
 
             node_commands = nodes.values()
-            for n in node_commands:
-                nodes_written += 1
-                n.write()
+            writers = [n.cowrite() for n in node_commands]
+            for _ in zip_longest(*writers):
+                pass
 
             for n in node_commands:
                 n.read()

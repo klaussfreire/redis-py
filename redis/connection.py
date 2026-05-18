@@ -256,6 +256,11 @@ class ConnectionInterface:
     def pack_commands(self, commands):
         pass
 
+    @abstractmethod
+    def gen_packed_commands(self, commands):
+        return
+        yield
+
     @property
     @abstractmethod
     def handshake_metadata(self) -> Union[Dict[bytes, bytes], Dict[str, str]]:
@@ -1291,7 +1296,11 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 with_failure_count=True,
             )
 
-    def send_packed_command(self, command, check_health=True):
+    def send_packed_command(self, command, check_health=True, maxblock=512):
+        for _ in self.cosend_packed_command(command, check_health, maxblock):
+            pass
+
+    def cosend_packed_command(self, command, check_health=True, maxblock=32):
         """Send an already packed command to the Redis server"""
         if not self._sock:
             self.connect_check_health(check_health=False)
@@ -1306,16 +1315,17 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 ncommand = len(command)
             if ncommand:
-                msgblock = min(512, SC_IOV_MAX)
+                msgblock = min(maxblock, SC_IOV_MAX)
                 if msgblock and ncommand > 4:
                     # use iovec for lower overhead on large pipelines
                     if msgblock >= ncommand:
                         flags = 0
                     else:
                         flags = socket.MSG_MORE
-                    sent = sock.sendmsg(islice(command, msgblock), (), flags)
+                    sent = sock.sendmsg(command[:msgblock], (), flags)
                     lastblock = ncommand - msgblock
                     lastpos = ncommand - 1
+                    yield
                     for pos, item in enumerate(command):
                         itemlen = len(item)
                         if sent >= itemlen:
@@ -1325,7 +1335,8 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                             # send another block
                             if pos >= lastblock:
                                 flags = 0
-                            sent = sock.sendmsg(islice(command, pos, pos + msgblock), (), flags)
+                            sent = sock.sendmsg(command[pos : pos + msgblock], (), flags)
+                            yield
                             if sent >= itemlen:
                                 sent -= itemlen
                                 continue
@@ -1339,12 +1350,26 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                             item = item[sent:]
                             sock.sendall(item, flags)
                             sent = 0
+                            yield
+                    if flags:
+                        # Un-cork if we corked the last block
+                        sock.send(b"")
                 else:
                     # regular corked sendall
+                    # length could be inaccurate so don't count on it
+                    # split along ncommand - 1 in a way that it works
+                    # whether it's the true last command or not
                     flags = socket.MSG_MORE
-                    for item in command[:-1]:
+                    icommand = iter(command)
+                    for item in islice(icommand, ncommand - 1):
                         sock.sendall(item, flags)
-                    sock.sendall(command[-1])
+                        yield
+                    for item in icommand:
+                        flags = 0
+                        sock.sendall(item)
+                    if flags:
+                        # Un-cork if we corked the last item
+                        sock.send(b"")
         except socket.timeout:
             self.disconnect()
             raise TimeoutError("Timeout writing to socket")
@@ -1440,8 +1465,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         return self._command_packer.pack(*args)
 
     def pack_commands(self, commands):
+        return list(self.gen_packed_commands(commands))
+
+    def gen_packed_commands(self, commands):
         """Pack multiple commands into the Redis protocol"""
-        output = []
         pieces = []
         buffer_length = 0
         buffer_cutoff = self._buffer_cutoff
@@ -1455,19 +1482,18 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                     or isinstance(chunk, memoryview)
                 ):
                     if pieces:
-                        output.append(SYM_EMPTY.join(pieces))
+                        yield SYM_EMPTY.join(pieces)
                     buffer_length = 0
                     pieces = []
 
                 if chunklen > buffer_cutoff or isinstance(chunk, memoryview):
-                    output.append(chunk)
+                    yield chunk
                 else:
                     pieces.append(chunk)
                     buffer_length += chunklen
 
         if pieces:
-            output.append(SYM_EMPTY.join(pieces))
-        return output
+            yield SYM_EMPTY.join(pieces)
 
     def get_protocol(self) -> Union[int, str]:
         return self.protocol
@@ -1844,6 +1870,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def pack_commands(self, commands):
         return self._conn.pack_commands(commands)
+
+    def gen_packed_commands(self, commands):
+        return self._conn.gen_packed_commands(commands)
 
     @property
     def handshake_metadata(self) -> Union[Dict[bytes, bytes], Dict[str, str]]:

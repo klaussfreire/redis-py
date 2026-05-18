@@ -7,6 +7,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, TypeVar, Union
+from itertools import islice
 
 from redis.exceptions import DataError
 from redis.typing import AbsExpiryT, EncodableT, ExpiryT
@@ -520,3 +521,84 @@ def experimental_args(
             return wrapper
 
     return decorator
+
+
+class LazyList:
+    """
+    A list that is lazily populated out of a generator.
+
+    The generator is advanced on-demand only, as entries are needed.
+    An expected total length is required. If not given, the generator
+    itself should provide the Sizable interface
+    (i.e. implement __len__) so the length can be determined.
+    """
+
+    def __init__(self, generator, length=None, generated=None):
+        self._iter = iter(generator)
+        self._generated = [] if generated is None else generated
+        if length is None:
+            length = len(generator)
+        self._length = length
+
+    def __getitem__(self, index):
+        generated = self._generated
+        ngenerated = len(generated)
+        if isinstance(index, slice):
+            end = iend = index.stop
+            regen = False
+            if end is None:
+                generated.extend(self._iter)
+                ngenerated = self._length = len(generated)
+                end = self._length
+            elif end < 0:
+                end = max(0, end + self._length)
+                regen = True
+            if end > ngenerated:
+                generated.extend(islice(self._iter, end - ngenerated))
+                ngenerated = len(generated)
+                if ngenerated > self._length:
+                    self._length = ngenerated
+            if ngenerated != self._length:
+                start = index.start
+                if start is not None and start < 0:
+                    start = max(0, start + self._length)
+                    regen = True
+                    if iend is not None and iend < 0:
+                        # If the length estimate was wrong, end-relative are too
+                        end = max(0, iend + self._length)
+                if regen:
+                    # can't support negative endpoints, generated is the wrong length
+                    index = slice(start, end, index.step)
+        else:
+            if index < 0:
+                index = max(0, index + self._length)
+            if index >= ngenerated:
+                generated.extend(islice(self._iter, index - ngenerated + 1))
+        return generated[index]
+
+    def __eq__(self, other):
+        return list(self) == other
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}("
+            f"{self._iter}, "
+            f"length={self._length}, "
+            f"generated={self._generated})"
+        )
+
+    def __iter__(self):
+        generated = self._generated
+        yield from generated
+
+        for item in self._iter:
+            generated.append(item)
+            ngenerated = len(generated)
+            yield item
+
+            # if more were generated when we yielded, yield them now
+            if len(generated) > ngenerated:
+                yield from generated[ngenerated:]
+
+    def __len__(self):
+        return self._length
