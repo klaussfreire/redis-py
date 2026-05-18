@@ -1415,6 +1415,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             self.disconnect()
             raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
 
+    def buffer_response(self):
+        return self._parser.read_from_socket(raise_on_timeout=False, nonblock=True)
+
     def read_response(
         self,
         disable_decoding=False,

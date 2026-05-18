@@ -3735,6 +3735,11 @@ class NodeCommands:
             for c in commands:
                 c.result = e
 
+    def buffer_responses(self):
+        connection = self.connection
+        while connection.buffer_response():
+            pass
+
     def read(self):
         """ """
         connection = self.connection
@@ -4180,7 +4185,7 @@ class PipelineStrategy(AbstractStrategy):
             # Start timing for observability
             start_time = time.monotonic()
 
-            writers = [[iter(n.cowrite())] for n in nodes.values()]
+            writers = [[iter(n.cowrite()), n] for n in nodes.values()]
             while writers:
                 writers_cycle = iter(cycle(writers))
                 for wgencell in writers_cycle:
@@ -4193,6 +4198,9 @@ class PipelineStrategy(AbstractStrategy):
                     except StopIteration:
                         nodes_written += 1
                         wgencell[0] = None
+                    else:
+                        # read from socket if there's data to unblock the server
+                        wgencell[1].buffer_responses()
                 writers = [wgencell for wgencell in writers if wgencell[0] is not None]
 
             for n in nodes.values():

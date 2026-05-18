@@ -49,11 +49,13 @@ class SocketBuffer:
         length: Optional[int] = None,
         timeout: Union[float, object] = SENTINEL,
         raise_on_timeout: Optional[bool] = True,
+        nonblocking: bool = False,
     ) -> bool:
         sock = self._sock
         socket_read_size = self.socket_read_size
         marker = 0
         custom_timeout = timeout is not SENTINEL
+        flags = socket.MSG_DONTWAIT if nonblocking else 0
 
         buf = self._buffer
         current_pos = buf.tell()
@@ -62,7 +64,7 @@ class SocketBuffer:
             sock.settimeout(timeout)
         try:
             while True:
-                data = sock.recv(socket_read_size)
+                data = sock.recv(socket_read_size, flags)
                 # an empty string indicates the server shutdown the socket
                 if isinstance(data, bytes) and len(data) == 0:
                     raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
@@ -93,7 +95,7 @@ class SocketBuffer:
 
     def can_read(self, timeout: float) -> bool:
         return bool(self.unread_bytes()) or self._read_from_socket(
-            timeout=timeout, raise_on_timeout=False
+            timeout=timeout, raise_on_timeout=False,
         )
 
     def read(self, length: int, timeout: Union[float, object] = SENTINEL) -> bytes:
