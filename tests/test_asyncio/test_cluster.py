@@ -694,6 +694,7 @@ class TestRedisClusterObj:
                 with mock.patch.multiple(
                     Connection,
                     send_packed_command=mock.DEFAULT,
+                    cosend_packed_command=mock.DEFAULT,
                     connect=mock.DEFAULT,
                     can_read_destructive=mock.DEFAULT,
                 ) as mocks:
@@ -737,6 +738,7 @@ class TestRedisClusterObj:
                     initialize.side_effect = initialize_mock
                     mocks["can_read_destructive"].return_value = False
                     mocks["send_packed_command"].return_value = "MOCK_OK"
+                    mocks["cosend_packed_command"].return_value = iter(["MOCK_OK"])
                     mocks["connect"].return_value = None
                     with mock.patch.object(
                         AsyncCommandsParser, "initialize", autospec=True
