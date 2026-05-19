@@ -4059,6 +4059,7 @@ class PipelineStrategy(AbstractStrategy):
         nodes: dict[str, NodeCommands] = {}
         nodes_written = 0
         nodes_read = 0
+        dirty_nodes = set()
         pipe = self._pipe
 
         # commonly used policies for reuse
@@ -4180,22 +4181,26 @@ class PipelineStrategy(AbstractStrategy):
             # Start timing for observability
             start_time = time.monotonic()
 
-            writers = [[iter(n.cowrite())] for n in nodes.values()]
+            writers = [
+                [iter(n.cowrite()), n, node_name]
+                for node_name, n in nodes.items()
+            ]
             while writers:
                 writers_cycle = iter(cycle(writers))
                 for wgencell in writers_cycle:
-                    wgen = wgencell[0]
+                    wgen, node, node_name = wgencell
                     if wgen is None:
                         # clean up writers cycle
                         break
                     try:
+                        dirty_nodes.add(node_name)
                         _ = next(wgen)
                     except StopIteration:
                         nodes_written += 1
                         wgencell[0] = None
                 writers = [wgencell for wgencell in writers if wgencell[0] is not None]
 
-            for n in nodes.values():
+            for node_name, n in nodes.items():
                 n.read()
 
                 # Find the first error in this node's commands, if any
@@ -4214,6 +4219,7 @@ class PipelineStrategy(AbstractStrategy):
                     error=node_error,
                 )
                 nodes_read += 1
+                dirty_nodes.discard(node_name)
         finally:
             # release all the redis connections we allocated earlier
             # back into the connection pool.
@@ -4228,9 +4234,10 @@ class PipelineStrategy(AbstractStrategy):
             # through nodes.values() in the same order as we are when
             # reading / writing to the connections above, which is critical
             # for how we're using the nodes_written/nodes_read offsets.
-            for i, n in enumerate(nodes.values()):
-                if i < nodes_written and i >= nodes_read:
-                    n.connection.disconnect()
+            for node_name in dirty_nodes:
+                n = nodes[node_name]
+                n.connection.disconnect()
+            for n in nodes.values():
                 n.connection_pool.release(n.connection)
 
         # if the response isn't an exception it is a
