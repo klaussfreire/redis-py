@@ -18,6 +18,14 @@ def devenv(c, endpoints="all"):
 
 
 @task
+def stopdevenv(c, endpoints="all"):
+    """Brings up the test environment, by wrapping docker compose."""
+    clean(c)
+    cmd = f"docker compose --profile {endpoints} down"
+    run(cmd)
+
+
+@task
 def build_docs(c):
     """Generates the sphinx documentation."""
     run("pip install -r docs/requirements.txt")
