@@ -260,6 +260,8 @@ def get_mocked_redis_client(
 def mock_node_resp(node, response):
     connection = Mock()
     connection.read_response.return_value = response
+    connection.buffer_response.return_value = False
+    connection.cosend_packed_command.side_effect = lambda *p, **kw: iter([None])
     node.redis_connection.connection = connection
     return node
 
@@ -267,6 +269,8 @@ def mock_node_resp(node, response):
 def mock_node_resp_func(node, func):
     connection = Mock()
     connection.read_response.side_effect = func
+    connection.buffer_response.return_value = False
+    connection.cosend_packed_command.side_effect = lambda *p, **kw: iter([None])
     node.redis_connection.connection = connection
     return node
 
@@ -4241,6 +4245,10 @@ class TestClusterPipeline:
             else:
                 raise RuntimeError("Simulated write error")
 
+        def mock_cowrite(self):
+            mock_write(self)
+            yield
+
         # Patch Connection.disconnect so we can assert that at least one
         # connection was disconnected when the write error occurred.
         original_disconnect = Connection.disconnect
@@ -4251,7 +4259,11 @@ class TestClusterPipeline:
             return original_disconnect(self, *args)
 
         with patch.object(Connection, "disconnect", track_disconnect):
-            with patch.object(redis.cluster.NodeCommands, "write", mock_write):
+            with patch.multiple(
+                redis.cluster.NodeCommands,
+                write=mock_write,
+                cowrite=mock_cowrite,
+            ):
                 with pytest.raises(RuntimeError):
                     r.pipeline().get("a").get("b").execute()
 
