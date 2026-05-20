@@ -1296,11 +1296,11 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 with_failure_count=True,
             )
 
-    def send_packed_command(self, command, check_health=True, maxblock=512):
+    def send_packed_command(self, command, check_health=True, maxblock=768):
         for _ in self.cosend_packed_command(command, check_health, maxblock):
             pass
 
-    def cosend_packed_command(self, command, check_health=True, maxblock=32):
+    def cosend_packed_command(self, command, check_health=True, maxblock=768):
         """Send an already packed command to the Redis server"""
         if not self._sock:
             self.connect_check_health(check_health=False)
@@ -1316,16 +1316,19 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 ncommand = len(command)
             else:
                 ncommand = None
-            if ncommand is None or ncommand > 4:
+            blocksz = min(maxblock, SC_IOV_MAX)
+            yield_every = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+            unyielded_bytes = 0
+            blocksz = min(blocksz, max(32, yield_every // self._buffer_cutoff))
+            if blocksz > 16 and (ncommand is None or ncommand > 4):
                 # Send in blocks of up to blocksz buffers using sendmsg
-                blocksz = min(maxblock, SC_IOV_MAX)
                 icommand = iter(command)
                 block = []
                 flags = socket.MSG_MORE
                 while True:
                     blocklen = len(block)
                     if blocklen < blocksz:
-                        block.extend(islice(icommand, blocksz - len(block)))
+                        block.extend(islice(icommand, blocksz - blocklen))
                         blocklen = len(block)
                     if blocklen == 0:
                         break
@@ -1335,7 +1338,12 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                         flags = 0
 
                     sent = sock.sendmsg(block, (), flags)
-                    yield
+
+                    unyielded_bytes += sent
+                    if unyielded_bytes >= yield_every:
+                        unyielded_bytes = 0
+                        yield
+
                     for pos, item in enumerate(block):
                         itemlen = len(item)
                         if sent >= itemlen:
@@ -1358,16 +1366,23 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 if flags:
                     # Un-cork if we corked the last block
                     sock.send(b"")
-            elif ncommand > 0:
+            else:
                 # regular corked sendall
                 # length could be inaccurate so don't count on it
                 # split along ncommand - 1 in a way that it works
                 # whether it's the true last command or not
                 flags = socket.MSG_MORE
                 icommand = iter(command)
-                for item in islice(icommand, ncommand - 1):
-                    sock.sendall(item, flags)
-                    yield
+                if ncommand:
+                    for pos, item in enumerate(islice(icommand, ncommand - 1), 1):
+                        sock.sendall(item, flags)
+                        if pos % maxblock == 0:
+                            yield
+                else:
+                    for pos, item in enumerate(icommand, 1):
+                        sock.sendall(item, flags)
+                        if pos % maxblock == 0:
+                            yield
                 for item in icommand:
                     flags = 0
                     sock.sendall(item)
