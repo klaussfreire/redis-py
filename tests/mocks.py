@@ -1,4 +1,5 @@
 # Various mocks for testing
+import socket
 
 
 class MockSocket:
@@ -39,3 +40,12 @@ class MockSocket:
         self.pos += len(result)
         buffer[: len(result)] = result
         return len(result)
+
+    __sockopts = {
+        socket.SOL_SOCKET: {
+            socket.SO_SNDBUF: 200 * 1024,
+        }
+    }
+
+    def getsockopt(self, level, optname):
+        return self.__sockopts.get(level, {}).get(optname)
