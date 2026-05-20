@@ -379,6 +379,15 @@ class MockSocket:
         """Simulate socket shutdown."""
         pass
 
+    __sockopts = {
+        socket.SOL_SOCKET: {
+            socket.SO_SNDBUF: 200 * 1024,
+        }
+    }
+
+    def getsockopt(self, level, optname):
+        return self.__sockopts.get(level, {}).get(optname)
+
 
 class TestMaintenanceNotificationsBase:
     """Base class for maintenance notifications handling tests."""
