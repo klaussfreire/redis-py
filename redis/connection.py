@@ -1319,7 +1319,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             blocksz = min(maxblock, SC_IOV_MAX)
             yield_every = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
             unyielded_bytes = 0
-            blocksz = min(blocksz, max(32, yield_every // self._buffer_cutoff))
+            blocksz = min(blocksz, max(32, yield_every // self._buffer_cutoff // 2))
             if blocksz > 16 and (ncommand is None or ncommand > 4):
                 # Send in blocks of up to blocksz buffers using sendmsg
                 icommand = iter(command)
