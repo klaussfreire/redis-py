@@ -1406,6 +1406,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                         del block[:]
                         blockbytes = 0
                     else:
+                        # partial send, figure what data has been sent and take it out
                         for pos, item in enumerate(block):
                             itemlen = len(item)
                             if sent >= itemlen:
@@ -1413,8 +1414,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                                 continue
 
                             if sent > 0:
-                                # partial send, finish the buffer with sendall in case
-                                # it's really big where sendall is more efficient
+                                # partial buffer send, slice it in memoryview form
                                 if not isinstance(item, memoryview):
                                     item = memoryview(item)
                                 item = item[sent:]
