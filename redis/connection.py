@@ -1317,9 +1317,60 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 ncommand = None
             blocksz = min(maxblock, SC_IOV_MAX)
-            yield_every = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+            yield_every = max(1, sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2)
             unyielded_bytes = 0
-            blocksz = min(blocksz, max(32, yield_every // self._buffer_cutoff // 2))
+            maxblockbytes = yield_every
+            blockbytes = 0
+
+            # On the rationale of the above computation.
+            #
+            # We send data from the app to the kernel socket in batches of blocksz
+            # buffers of roughly _buffer_cutoff bytes each.
+            #
+            # That socket buffer has up to SO_SNDBUF bytes, so if we write that
+            # amount rightaway we'll start blocking.
+            #
+            # As soon as we write, data starts being transmitted to the server,
+            # where it will be queued in another socket's read buffer.
+            # That socket has up to SO_RCVBUF (of the other system, we don't know how much)
+            # Before the server has a chance to read much off of that buffer,
+            # we will try to write another batch. If our buffer hasn't cleared,
+            # we'll block.
+            #
+            # If we sent SO_SNDBUF now, and send another SO_SNDBUF again,
+            # we're right on the edge, assuming the server has a similar SNDBUF.
+            # Given how the logic is implemented, we can end up sending buffers
+            # slightly above the blocksz limit computed here, so we need some margin.
+            #
+            # Taking half the computed limit gives us that margin, and also ensures
+            # that we won't block on the second call to write
+            # (we have enough buffer to avoid blocking).
+            #
+            # After the second call, we'll read from the socket
+            # (with buffer_response), so we'll unblock the server and we'll be free
+            # to send another chunk next time.
+            #
+            # This assumes the server has some buffering too, if we want to be fully
+            # safe even if the server has a tiny buffer, we can do // 3, but in all
+            # the testing done // 2 seems OK in general if the server also buffers.
+            #
+            # Counting bytes after sendmsg is unavoidable, sendmsg doesn't guarantee
+            # all buffers will get sent fully on TCP connections, so we need to check}
+            # how many bytes and buffers were actually sent and adjust accordingly.
+            # Doing this is still a win compared to joining the buffers and using sendall
+            # as it avoids extra copying and allocations.
+            #
+            # NOTE:
+            #
+            # The only place where that logic breaks, is if the server responses
+            # are disproportionately big compared to our requests. That can happen
+            # if we get very big values in a big pipeline, but that's hard to prepare
+            # for without a nonblocking I/O loop.
+            #
+            # In that case, we can get blocked on a third write, before the server
+            # sent the first reply, and we'll never do the buffer_response call
+            # to unblock the server when it fills its buffer, and you get a deadlock.
+
             if blocksz > 16 and (ncommand is None or ncommand > 4):
                 # Send in blocks of up to blocksz buffers using sendmsg
                 icommand = iter(command)
@@ -1328,14 +1379,20 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 while True:
                     blocklen = len(block)
                     if blocklen < blocksz:
-                        block.extend(islice(icommand, blocksz - blocklen))
+                        blocktgtbytes = min(maxblockbytes, yield_every - unyielded_bytes)
+                        if blockbytes < maxblockbytes:
+                            for buf in islice(icommand, blocksz - blocklen):
+                                block.append(buf)
+                                blockbytes += len(buf)
+                                if blockbytes >= blocktgtbytes:
+                                    break
+                            else:
+                                if len(block) < blocksz:
+                                    # We reached the end of the commands iterator
+                                    flags = 0
                         blocklen = len(block)
                     if blocklen == 0:
                         break
-                    elif blocklen < blocksz:
-                        # if the block is smaller than the block size, it's the last block
-                        # so we don't need to set MSG_MORE
-                        flags = 0
 
                     sent = sock.sendmsg(block, (), flags)
 
@@ -1344,25 +1401,31 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                         unyielded_bytes = 0
                         yield
 
-                    for pos, item in enumerate(block):
-                        itemlen = len(item)
-                        if sent >= itemlen:
-                            sent -= itemlen
-                            continue
-
-                        if sent > 0:
-                            # partial send, finish the buffer with sendall in case
-                            # it's really big where sendall is more efficient
-                            if not isinstance(item, memoryview):
-                                item = memoryview(item)
-                            item = item[sent:]
-                            del block[:pos]
-                            block[0] = item
-                        else:
-                            del block[:pos + 1]
-                        break
-                    else:
+                    if sent == blockbytes:
+                        # full send
                         del block[:]
+                        blockbytes = 0
+                    else:
+                        for pos, item in enumerate(block):
+                            itemlen = len(item)
+                            if sent >= itemlen:
+                                sent -= itemlen
+                                continue
+
+                            if sent > 0:
+                                # partial send, finish the buffer with sendall in case
+                                # it's really big where sendall is more efficient
+                                if not isinstance(item, memoryview):
+                                    item = memoryview(item)
+                                item = item[sent:]
+                                del block[:pos]
+                                block[0] = item
+                            else:
+                                del block[:pos + 1]
+                            break
+                        else:
+                            del block[:]
+                        blockbytes = sum(map(len, block))
                 if flags:
                     # Un-cork if we corked the last block
                     sock.send(b"")
@@ -1491,6 +1554,12 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
 
     def gen_packed_commands(self, commands):
         """Pack multiple commands into the Redis protocol"""
+        #if SC_IOV_MAX >= 128:
+            # If we have a large enough IOV_MAX, we can just pack all commands
+            # and send them in one go without worrying about chunking them.
+        #    for cmd in commands:
+        #        yield from self._command_packer.pack(*cmd)
+
         pieces = []
         buffer_length = 0
         buffer_cutoff = self._buffer_cutoff
