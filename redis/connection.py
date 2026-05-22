@@ -1319,8 +1319,6 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             blocksz = min(maxblock, SC_IOV_MAX)
             yield_every = max(1, sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2)
             unyielded_bytes = 0
-            maxblockbytes = yield_every
-            blockbytes = 0
 
             # On the rationale of the above computation.
             #
@@ -1355,7 +1353,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             # the testing done // 2 seems OK in general if the server also buffers.
             #
             # Counting bytes after sendmsg is unavoidable, sendmsg doesn't guarantee
-            # all buffers will get sent fully on TCP connections, so we need to check}
+            # all buffers will get sent fully on TCP connections, so we need to check
             # how many bytes and buffers were actually sent and adjust accordingly.
             # Doing this is still a win compared to joining the buffers and using sendall
             # as it avoids extra copying and allocations.
@@ -1364,17 +1362,19 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             #
             # The only place where that logic breaks, is if the server responses
             # are disproportionately big compared to our requests. That can happen
-            # if we get very big values in a big pipeline, but that's hard to prepare
-            # for without a nonblocking I/O loop.
+            # if we get very big response values in a big pipeline, but that's hard
+            # to prepare for without a nonblocking I/O loop.
             #
             # In that case, we can get blocked on a third write, before the server
             # sent the first reply, and we'll never do the buffer_response call
-            # to unblock the server when it fills its buffer, and you get a deadlock.
+            # to unblock the server when it fills its buffer, ending in a deadlock.
 
             if blocksz > 16 and (ncommand is None or ncommand > 4):
                 # Send in blocks of up to blocksz buffers using sendmsg
                 icommand = iter(command)
                 block = []
+                blockbytes = 0
+                maxblockbytes = yield_every
                 flags = socket.MSG_MORE
                 while True:
                     blocklen = len(block)
@@ -1437,14 +1437,18 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 flags = socket.MSG_MORE
                 icommand = iter(command)
                 if ncommand:
-                    for pos, item in enumerate(islice(icommand, ncommand - 1), 1):
+                    for item in islice(icommand, ncommand - 1):
                         sock.sendall(item, flags)
-                        if pos % maxblock == 0:
+                        unyielded_bytes += len(item)
+                        if unyielded_bytes >= yield_every:
+                            unyielded_bytes = 0
                             yield
                 else:
-                    for pos, item in enumerate(icommand, 1):
+                    for item in icommand:
                         sock.sendall(item, flags)
-                        if pos % maxblock == 0:
+                        unyielded_bytes += len(item)
+                        if unyielded_bytes >= yield_every:
+                            unyielded_bytes = 0
                             yield
                 for item in icommand:
                     flags = 0
@@ -1554,18 +1558,13 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
 
     def gen_packed_commands(self, commands):
         """Pack multiple commands into the Redis protocol"""
-        #if SC_IOV_MAX >= 128:
-            # If we have a large enough IOV_MAX, we can just pack all commands
-            # and send them in one go without worrying about chunking them.
-        #    for cmd in commands:
-        #        yield from self._command_packer.pack(*cmd)
-
+        packer = self._command_packer
         pieces = []
         buffer_length = 0
         buffer_cutoff = self._buffer_cutoff
 
         for cmd in commands:
-            for chunk in self._command_packer.pack(*cmd):
+            for chunk in packer.pack(*cmd):
                 chunklen = len(chunk)
                 if (
                     buffer_length > buffer_cutoff
