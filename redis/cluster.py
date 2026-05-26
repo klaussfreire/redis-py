@@ -96,6 +96,11 @@ from redis.utils import (
 
 logger = logging.getLogger(__name__)
 
+if hasattr(sys, "_is_gil_enabled"):
+    _gil_enabled = sys._is_gil_enabled()
+else:
+    _gil_enabled = True
+
 
 def is_debug_log_enabled():
     return logger.isEnabledFor(logging.DEBUG)
@@ -2267,8 +2272,13 @@ class NodesManager:
         # slot-infos are immutable (it's mutable, but never mutated,
         # only replaced) so after getting a reference to the slot info,
         # we can safely operate on it without lock
-        slots_cache = self.slots_cache
-        slot_info = slots_cache.get(slot)
+        if _gil_enabled:
+            slots_cache = self.slots_cache
+            slot_info = slots_cache.get(slot)
+        else:
+            with self._lock:
+                slots_cache = self.slots_cache
+                slot_info = slots_cache.get(slot)
 
         if slot_info is None or len(slot_info) == 0:
             raise SlotNotCoveredError(
