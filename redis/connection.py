@@ -6,7 +6,7 @@ import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
-from itertools import chain
+from itertools import chain, islice
 from queue import Empty, Full, LifoQueue
 from typing import (
     Any,
@@ -107,6 +107,8 @@ SYM_STAR = b"*"
 SYM_DOLLAR = b"$"
 SYM_CRLF = b"\r\n"
 SYM_EMPTY = b""
+SYM_SPACE = b" "
+BYTE_SPACE = SYM_SPACE[0]
 
 DefaultParser: Type[Union[_RESP2Parser, _RESP3Parser, _HiredisParser]]
 if HIREDIS_AVAILABLE:
@@ -114,27 +116,33 @@ if HIREDIS_AVAILABLE:
 else:
     DefaultParser = _RESP2Parser
 
+try:
+    SC_IOV_MAX = os.sysconf("SC_IOV_MAX")
+except ValueError:
+    SC_IOV_MAX = 0
+
+if hasattr(socket, "MSG_MORE"):
+    MSG_MORE = socket.MSG_MORE
+else:
+    # The OS does not support MSG_MORE, set it to 0
+    # to use neutral flags instead
+    MSG_MORE = 0
+
 
 class HiredisRespSerializer:
     def pack(self, *args: List):
         """Pack a series of arguments into the Redis protocol"""
-        output = []
-
-        if isinstance(args[0], str):
-            args = tuple(args[0].encode().split()) + args[1:]
-        elif b" " in args[0]:
-            args = tuple(args[0].split()) + args[1:]
-        args = tuple(
-            bytes(arg) if isinstance(arg, (bytearray, memoryview)) else arg
-            for arg in args
-        )
+        args = tuple(bytes(arg) if isinstance(arg, bytearray) else arg for arg in args)
+        arg0 = args[0]
+        if isinstance(arg0, str):
+            args = tuple(arg0.encode().split()) + args[1:]
+        elif BYTE_SPACE in arg0:
+            args = tuple(arg0.split()) + args[1:]
         try:
-            output.append(hiredis.pack_command(args))
+            return [hiredis.pack_command(args)]
         except TypeError:
             _, value, traceback = sys.exc_info()
             raise DataError(value).with_traceback(traceback)
-
-        return output
 
 
 class PythonRespSerializer:
@@ -150,10 +158,11 @@ class PythonRespSerializer:
         # arguments to be sent separately, so split the first argument
         # manually. These arguments should be bytestrings so that they are
         # not encoded.
-        if isinstance(args[0], str):
-            args = tuple(args[0].encode().split()) + args[1:]
-        elif b" " in args[0]:
-            args = tuple(args[0].split()) + args[1:]
+        arg0 = args[0]
+        if isinstance(arg0, str):
+            args = tuple(arg0.encode().split()) + args[1:]
+        elif BYTE_SPACE in arg0:
+            args = tuple(arg0.split()) + args[1:]
 
         buff = SYM_EMPTY.join((SYM_STAR, str(len(args)).encode(), SYM_CRLF))
 
@@ -1301,10 +1310,56 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         if check_health:
             self.check_health()
         try:
+            sock = self._sock
             if isinstance(command, str):
                 command = [command]
-            for item in command:
-                self._sock.sendall(item)
+                ncommand = 1
+            else:
+                ncommand = len(command)
+            if ncommand:
+                msgblock = min(512, SC_IOV_MAX)
+                if not hasattr(sock, "sendmsg"):
+                    msgblock = 0
+                if msgblock and ncommand > 4:
+                    # use iovec for lower overhead on large pipelines
+                    if msgblock >= ncommand:
+                        flags = 0
+                    else:
+                        flags = MSG_MORE
+                    sent = sock.sendmsg(islice(command, msgblock), (), flags)
+                    lastblock = ncommand - msgblock
+                    lastpos = ncommand - 1
+                    for pos, item in enumerate(command):
+                        itemlen = len(item)
+                        if sent >= itemlen:
+                            sent -= itemlen
+                            continue
+                        elif sent == 0:
+                            # send another block
+                            if pos >= lastblock:
+                                flags = 0
+                            sent = sock.sendmsg(
+                                islice(command, pos, pos + msgblock), (), flags
+                            )
+                            if sent >= itemlen:
+                                sent -= itemlen
+                                continue
+                        if sent and sent < itemlen:
+                            # partial send, finish the buffer with sendall in case
+                            # it's really big where sendall is more efficient
+                            if not isinstance(item, memoryview):
+                                item = memoryview(item)
+                            if pos >= lastpos:
+                                flags = 0
+                            item = item[sent:]
+                            sock.sendall(item, flags)
+                            sent = 0
+                else:
+                    # regular corked sendall
+                    flags = MSG_MORE
+                    for item in command[:-1]:
+                        sock.sendall(item, flags)
+                    sock.sendall(command[-1])
         except socket.timeout:
             self.disconnect()
             raise TimeoutError("Timeout writing to socket")
