@@ -1323,9 +1323,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                         flags = 0
                     else:
                         flags = MSG_MORE
-                    sent = sock.sendmsg(
-                        islice(command, msgblock), (), flags
-                    )
+                    sent = sock.sendmsg(islice(command, msgblock), (), flags)
                     lastblock = ncommand - msgblock
                     lastpos = ncommand - 1
                     for pos, item in enumerate(command):
@@ -1337,7 +1335,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                             # send another block
                             if pos >= lastblock:
                                 flags = 0
-                            sent = sock.sendmsg(islice(command, pos, pos + msgblock), (), flags)
+                            sent = sock.sendmsg(
+                                islice(command, pos, pos + msgblock), (), flags
+                            )
                             if sent >= itemlen:
                                 sent -= itemlen
                                 continue
