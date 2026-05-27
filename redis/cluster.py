@@ -2304,11 +2304,7 @@ class NodesManager:
             node_idx = self.read_load_balancer.get_server_index(
                 primary_name, len(slot_info), load_balancing_strategy
             )
-        elif (
-            server_type is None
-            or server_type == PRIMARY
-            or len(slot_info) == 1
-        ):
+        elif server_type is None or server_type == PRIMARY or len(slot_info) == 1:
             # return a primary
             node_idx = 0
         else:
@@ -3468,7 +3464,7 @@ class ClusterPipeline(RedisCluster):
             RequestPolicy.DEFAULT_KEYED: lambda self, command, *args, **kwargs: (
                 self.get_nodes_from_slot(command, *args)
             ),
-            RequestPolicy.DEFAULT_NODE: lambda self, command, *args, **kwargs:  [
+            RequestPolicy.DEFAULT_NODE: lambda self, command, *args, **kwargs: [
                 self.get_default_node()
             ],
             RequestPolicy.ALL_SHARDS: lambda self, command, *args, **kwargs: (
@@ -4222,8 +4218,7 @@ class PipelineStrategy(AbstractStrategy):
             start_time = time.monotonic()
 
             writers = [
-                [iter(n.cowrite()), n, node_name]
-                for node_name, n in nodes.items()
+                [iter(n.cowrite()), n, node_name] for node_name, n in nodes.items()
             ]
             while writers:
                 writers_cycle = iter(cycle(writers))
