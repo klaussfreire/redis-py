@@ -1369,7 +1369,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                             del block[:pos]
                             block[0] = item
                         else:
-                            del block[:pos + 1]
+                            del block[: pos + 1]
                         break
                     else:
                         del block[:]
