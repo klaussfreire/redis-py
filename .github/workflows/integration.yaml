@@ -18,6 +18,7 @@ on:
       - tcp_cork
       - tcp_multiplex
       - tcp_read_multiplex
+      - micro_opt
   schedule:
     - cron: '0 1 * * *' # nightly build
 
