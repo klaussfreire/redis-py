@@ -117,9 +117,10 @@ else:
     DefaultParser = _RESP2Parser
 
 try:
-    SC_IOV_MAX = os.sysconf('SC_IOV_MAX')
+    SC_IOV_MAX = os.sysconf("SC_IOV_MAX")
 except ValueError:
     SC_IOV_MAX = 0
+
 
 class HiredisRespSerializer:
     def pack(self, *args: List):
