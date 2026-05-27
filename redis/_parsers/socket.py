@@ -95,7 +95,8 @@ class SocketBuffer:
 
     def can_read(self, timeout: float) -> bool:
         return bool(self.unread_bytes()) or self.read_from_socket(
-            timeout=timeout, raise_on_timeout=False,
+            timeout=timeout,
+            raise_on_timeout=False,
         )
 
     def read(self, length: int, timeout: Union[float, object] = SENTINEL) -> bytes:

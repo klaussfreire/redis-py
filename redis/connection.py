@@ -1327,7 +1327,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             blocksz = min(maxblock, SC_IOV_MAX)
             if not hasattr(sock, "sendmsg"):
                 blocksz = 1
-            yield_every = max(1, sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2)
+            yield_every = max(
+                1, sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2
+            )
             unyielded_bytes = 0
 
             # On the rationale of the above computation.
@@ -1389,7 +1391,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 while True:
                     blocklen = len(block)
                     if blocklen < blocksz:
-                        blocktgtbytes = min(maxblockbytes, yield_every - unyielded_bytes)
+                        blocktgtbytes = min(
+                            maxblockbytes, yield_every - unyielded_bytes
+                        )
                         if blockbytes < maxblockbytes:
                             for buf in islice(icommand, blocksz - blocklen):
                                 block.append(buf)
