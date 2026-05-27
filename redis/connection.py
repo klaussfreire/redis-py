@@ -33,7 +33,6 @@ from redis.cache import (
 )
 
 from ._parsers import Encoder, _HiredisParser, _RESP2Parser, _RESP3Parser
-from ._parsers.socket import SENTINEL
 from .auth.token import TokenInterface
 from .backoff import NoBackoff
 from .credentials import CredentialProvider, UsernamePasswordCredentialProvider
@@ -84,6 +83,7 @@ from .utils import (
     CRYPTOGRAPHY_AVAILABLE,
     DEFAULT_RESP_VERSION,
     HIREDIS_AVAILABLE,
+    SENTINEL,
     SSL_AVAILABLE,
     check_protocol_version,
     compare_versions,
@@ -132,6 +132,10 @@ else:
 class HiredisRespSerializer:
     def pack(self, *args: List):
         """Pack a series of arguments into the Redis protocol"""
+        args = tuple(
+            bytes(arg) if isinstance(arg, bytearray) else arg
+            for arg in args
+        )
         arg0 = args[0]
         if isinstance(arg0, str):
             args = tuple(arg0.encode().split()) + args[1:]
@@ -242,7 +246,9 @@ class ConnectionInterface:
         pass
 
     @abstractmethod
-    def can_read(self, timeout=0):
+    def can_read(self, timeout: float = 0) -> bool:
+        # TODO: Rename this API; it detects pending data or dirty/closed
+        # connection state, not only whether application data can be read.
         pass
 
     @abstractmethod
@@ -807,9 +813,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         socket_read_size: int = 65536,
         health_check_interval: int = 0,
         client_name: Optional[str] = None,
-        lib_name: Optional[str] = None,
-        lib_version: Optional[str] = None,
-        driver_info: Optional[DriverInfo] = None,
+        lib_name: Union[Optional[str], object] = SENTINEL,
+        lib_version: Union[Optional[str], object] = SENTINEL,
+        driver_info: Union[Optional[DriverInfo], object] = SENTINEL,
         username: Optional[str] = None,
         retry: Union[Any, None] = None,
         redis_connect_func: Optional[Callable[[], None]] = None,
@@ -844,7 +850,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         driver_info : DriverInfo, optional
             Driver metadata for CLIENT SETINFO. If provided, lib_name and lib_version
             are ignored. If not provided, a DriverInfo will be created from lib_name
-            and lib_version (or defaults if those are also None).
+            and lib_version. Explicit None disables CLIENT SETINFO.
         lib_name : str, optional
             **Deprecated.** Use driver_info instead. Library name for CLIENT SETINFO.
         lib_version : str, optional
@@ -865,7 +871,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self.db = db
         self.client_name = client_name
 
-        # Handle driver_info: if provided, use it; otherwise create from lib_name/lib_version
+        # Handle driver_info: if provided, use it; otherwise create from lib_name/lib_version.
         self.driver_info = resolve_driver_info(driver_info, lib_name, lib_version)
 
         self.credential_provider = credential_provider
@@ -1424,8 +1430,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             check_health=kwargs.get("check_health", True),
         )
 
-    def can_read(self, timeout=0):
+    def can_read(self, timeout: float = 0) -> bool:
         """Poll the socket to see if there's data that can be read."""
+        # TODO: Rename this API; it detects pending data or dirty/closed
+        # connection state, not only whether application data can be read.
         sock = self._sock
         if not sock:
             self.connect()
@@ -1805,10 +1813,16 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             if self._cache.get(self._current_command_cache_key):
                 entry = self._cache.get(self._current_command_cache_key)
 
-                if entry.connection_ref != self._conn:
-                    with self._pool_lock:
-                        while entry.connection_ref.can_read():
-                            entry.connection_ref.read_response(push_request=True)
+                with self._pool_lock:
+                    while entry.connection_ref.can_read():
+                        try:
+                            entry.connection_ref.read_response(
+                                push_request=True,
+                                timeout=0,
+                                disconnect_on_error=False,
+                            )
+                        except TimeoutError:
+                            break
 
                 # Re-check: if the entry was invalidated during the drain,
                 # fall through to send the command over the network.
@@ -1830,7 +1844,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # read-only command that not yet cached.
         self._conn.send_command(*args, **kwargs)
 
-    def can_read(self, timeout=0):
+    def can_read(self, timeout: float = 0) -> bool:
+        # TODO: Rename this API; it detects pending data or dirty/closed
+        # connection state, not only whether application data can be read.
         return self._conn.can_read(timeout)
 
     def read_response(
@@ -2035,7 +2051,12 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def _process_pending_invalidations(self):
         while self.can_read():
-            self._conn.read_response(push_request=True)
+            try:
+                self._conn.read_response(
+                    push_request=True, timeout=0, disconnect_on_error=False
+                )
+            except TimeoutError:
+                break
 
     def _on_invalidation_callback(self, data: List[Union[str, Optional[List[bytes]]]]):
         with self._cache_lock:
