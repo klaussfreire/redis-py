@@ -33,7 +33,6 @@ from redis.cache import (
 )
 
 from ._parsers import Encoder, _HiredisParser, _RESP2Parser, _RESP3Parser
-from ._parsers.socket import SENTINEL
 from .auth.token import TokenInterface
 from .backoff import NoBackoff
 from .credentials import CredentialProvider, UsernamePasswordCredentialProvider
@@ -84,6 +83,7 @@ from .utils import (
     CRYPTOGRAPHY_AVAILABLE,
     DEFAULT_RESP_VERSION,
     HIREDIS_AVAILABLE,
+    SENTINEL,
     SSL_AVAILABLE,
     check_protocol_version,
     compare_versions,
@@ -117,13 +117,25 @@ else:
     DefaultParser = _RESP2Parser
 
 try:
-    SC_IOV_MAX = os.sysconf('SC_IOV_MAX')
+    SC_IOV_MAX = os.sysconf("SC_IOV_MAX")
 except ValueError:
     SC_IOV_MAX = 0
+
+if hasattr(socket, "MSG_MORE"):
+    MSG_MORE = socket.MSG_MORE
+else:
+    # The OS does not support MSG_MORE, set it to 0
+    # to use neutral flags instead
+    MSG_MORE = 0
+
 
 class HiredisRespSerializer:
     def pack(self, *args: List):
         """Pack a series of arguments into the Redis protocol"""
+        args = tuple(
+            bytes(arg) if isinstance(arg, bytearray) else arg
+            for arg in args
+        )
         arg0 = args[0]
         if isinstance(arg0, str):
             args = tuple(arg0.encode().split()) + args[1:]
@@ -234,7 +246,9 @@ class ConnectionInterface:
         pass
 
     @abstractmethod
-    def can_read(self, timeout=0):
+    def can_read(self, timeout: float = 0) -> bool:
+        # TODO: Rename this API; it detects pending data or dirty/closed
+        # connection state, not only whether application data can be read.
         pass
 
     @abstractmethod
@@ -258,8 +272,7 @@ class ConnectionInterface:
 
     @abstractmethod
     def gen_packed_commands(self, commands):
-        return
-        yield
+        yield from ()
 
     @property
     @abstractmethod
@@ -800,9 +813,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         socket_read_size: int = 65536,
         health_check_interval: int = 0,
         client_name: Optional[str] = None,
-        lib_name: Optional[str] = None,
-        lib_version: Optional[str] = None,
-        driver_info: Optional[DriverInfo] = None,
+        lib_name: Union[Optional[str], object] = SENTINEL,
+        lib_version: Union[Optional[str], object] = SENTINEL,
+        driver_info: Union[Optional[DriverInfo], object] = SENTINEL,
         username: Optional[str] = None,
         retry: Union[Any, None] = None,
         redis_connect_func: Optional[Callable[[], None]] = None,
@@ -837,7 +850,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         driver_info : DriverInfo, optional
             Driver metadata for CLIENT SETINFO. If provided, lib_name and lib_version
             are ignored. If not provided, a DriverInfo will be created from lib_name
-            and lib_version (or defaults if those are also None).
+            and lib_version. Explicit None disables CLIENT SETINFO.
         lib_name : str, optional
             **Deprecated.** Use driver_info instead. Library name for CLIENT SETINFO.
         lib_version : str, optional
@@ -858,7 +871,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         self.db = db
         self.client_name = client_name
 
-        # Handle driver_info: if provided, use it; otherwise create from lib_name/lib_version
+        # Handle driver_info: if provided, use it; otherwise create from lib_name/lib_version.
         self.driver_info = resolve_driver_info(driver_info, lib_name, lib_version)
 
         self.credential_provider = credential_provider
@@ -1311,13 +1324,17 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             sock = self._sock
             if isinstance(command, (str, bytes)):
                 command = [command]
-                ncommand == 1
+                ncommand = 1
             elif isinstance(command, list):
                 ncommand = len(command)
             else:
                 ncommand = None
             blocksz = min(maxblock, SC_IOV_MAX)
-            yield_every = max(1, sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2)
+            if not hasattr(sock, "sendmsg"):
+                blocksz = 1
+            yield_every = max(
+                1, sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2
+            )
             unyielded_bytes = 0
 
             # On the rationale of the above computation.
@@ -1375,11 +1392,13 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 block = []
                 blockbytes = 0
                 maxblockbytes = yield_every
-                flags = socket.MSG_MORE
+                flags = MSG_MORE
                 while True:
                     blocklen = len(block)
                     if blocklen < blocksz:
-                        blocktgtbytes = min(maxblockbytes, yield_every - unyielded_bytes)
+                        blocktgtbytes = min(
+                            maxblockbytes, yield_every - unyielded_bytes
+                        )
                         if blockbytes < maxblockbytes:
                             for buf in islice(icommand, blocksz - blocklen):
                                 block.append(buf)
@@ -1406,6 +1425,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                         del block[:]
                         blockbytes = 0
                     else:
+                        # partial send, figure what data has been sent and take it out
                         for pos, item in enumerate(block):
                             itemlen = len(item)
                             if sent >= itemlen:
@@ -1413,15 +1433,14 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                                 continue
 
                             if sent > 0:
-                                # partial send, finish the buffer with sendall in case
-                                # it's really big where sendall is more efficient
+                                # partial buffer send, slice it in memoryview form
                                 if not isinstance(item, memoryview):
                                     item = memoryview(item)
                                 item = item[sent:]
                                 del block[:pos]
                                 block[0] = item
                             else:
-                                del block[:pos + 1]
+                                del block[: pos + 1]
                             break
                         else:
                             del block[:]
@@ -1434,7 +1453,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 # length could be inaccurate so don't count on it
                 # split along ncommand - 1 in a way that it works
                 # whether it's the true last command or not
-                flags = socket.MSG_MORE
+                flags = MSG_MORE
                 icommand = iter(command)
                 if ncommand:
                     for item in islice(icommand, ncommand - 1):
@@ -1482,8 +1501,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             check_health=kwargs.get("check_health", True),
         )
 
-    def can_read(self, timeout=0):
+    def can_read(self, timeout: float = 0) -> bool:
         """Poll the socket to see if there's data that can be read."""
+        # TODO: Rename this API; it detects pending data or dirty/closed
+        # connection state, not only whether application data can be read.
         sock = self._sock
         if not sock:
             self.connect()
@@ -1867,10 +1888,16 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
             if self._cache.get(self._current_command_cache_key):
                 entry = self._cache.get(self._current_command_cache_key)
 
-                if entry.connection_ref != self._conn:
-                    with self._pool_lock:
-                        while entry.connection_ref.can_read():
-                            entry.connection_ref.read_response(push_request=True)
+                with self._pool_lock:
+                    while entry.connection_ref.can_read():
+                        try:
+                            entry.connection_ref.read_response(
+                                push_request=True,
+                                timeout=0,
+                                disconnect_on_error=False,
+                            )
+                        except TimeoutError:
+                            break
 
                 # Re-check: if the entry was invalidated during the drain,
                 # fall through to send the command over the network.
@@ -1892,7 +1919,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
         # read-only command that not yet cached.
         self._conn.send_command(*args, **kwargs)
 
-    def can_read(self, timeout=0):
+    def can_read(self, timeout: float = 0) -> bool:
+        # TODO: Rename this API; it detects pending data or dirty/closed
+        # connection state, not only whether application data can be read.
         return self._conn.can_read(timeout)
 
     def read_response(
@@ -2097,7 +2126,12 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def _process_pending_invalidations(self):
         while self.can_read():
-            self._conn.read_response(push_request=True)
+            try:
+                self._conn.read_response(
+                    push_request=True, timeout=0, disconnect_on_error=False
+                )
+            except TimeoutError:
+                break
 
     def _on_invalidation_callback(self, data: List[Union[str, Optional[List[bytes]]]]):
         with self._cache_lock:

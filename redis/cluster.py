@@ -36,7 +36,7 @@ from redis.backoff import ExponentialWithJitterBackoff, NoBackoff
 from redis.cache import CacheConfig, CacheFactory, CacheFactoryInterface, CacheInterface
 from redis.client import EMPTY_RESPONSE, CaseInsensitiveDict, PubSub, Redis
 from redis.commands import READ_COMMANDS, RedisClusterCommands
-from redis.commands.helpers import list_or_args
+from redis.commands.helpers import list_or_args, parse_pubsub_subscriptions
 from redis.commands.policies import PolicyResolver, StaticPolicyResolver
 from redis.connection import (
     Connection,
@@ -82,6 +82,7 @@ from redis.observability.recorder import (
     record_operation_duration,
 )
 from redis.retry import Retry
+from redis.typing import ChannelT, PubSubHandler, Subscription
 from redis.utils import (
     check_protocol_version,
     deprecated_args,
@@ -271,6 +272,7 @@ REDIS_ALLOWED_KEYS = (
     "encoding",
     "encoding_errors",
     "host",
+    "driver_info",
     "lib_name",
     "lib_version",
     "max_connections",
@@ -938,20 +940,27 @@ class RedisCluster(
             RequestPolicy.DEFAULT_KEYLESS: lambda self, command, *args, **kwargs: [
                 self.get_random_primary_or_all_nodes(command)
             ],
-            RequestPolicy.DEFAULT_KEYED: lambda self, command, *args, **kwargs:
-                self.get_nodes_from_slot(command, *args),
-            RequestPolicy.DEFAULT_NODE: lambda self, command, *args, **kwargs:
-                [self.get_default_node()],
-            RequestPolicy.ALL_SHARDS: lambda self, command, *args, **kwargs:
-                self.get_primaries(),
-            RequestPolicy.ALL_NODES: lambda self, command, *args, **kwargs:
-                self.get_nodes(),
-            RequestPolicy.ALL_REPLICAS: lambda self, command, *args, **kwargs:
-                self.get_replicas(),
-            RequestPolicy.MULTI_SHARD: lambda self, command, *args, **kwargs:
-                self._split_multi_shard_command(*args, **kwargs),
-            RequestPolicy.SPECIAL: lambda self, command, *args, **kwargs:
-                self.get_special_nodes(),
+            RequestPolicy.DEFAULT_KEYED: lambda self, command, *args, **kwargs: (
+                self.get_nodes_from_slot(command, *args)
+            ),
+            RequestPolicy.DEFAULT_NODE: lambda self, command, *args, **kwargs: [
+                self.get_default_node()
+            ],
+            RequestPolicy.ALL_SHARDS: lambda self, command, *args, **kwargs: (
+                self.get_primaries()
+            ),
+            RequestPolicy.ALL_NODES: lambda self, command, *args, **kwargs: (
+                self.get_nodes()
+            ),
+            RequestPolicy.ALL_REPLICAS: lambda self, command, *args, **kwargs: (
+                self.get_replicas()
+            ),
+            RequestPolicy.MULTI_SHARD: lambda self, command, *args, **kwargs: (
+                self._split_multi_shard_command(*args, **kwargs)
+            ),
+            RequestPolicy.SPECIAL: lambda self, command, *args, **kwargs: (
+                self.get_special_nodes()
+            ),
             ResponsePolicy.DEFAULT_KEYLESS: lambda res: res,
             ResponsePolicy.DEFAULT_KEYED: lambda res: res,
         }
@@ -1341,7 +1350,8 @@ class RedisCluster(
                 command_flag = self.command_flags.get(command)
 
             request_policy = self._command_flags_mapping.get(
-                command_flag, request_policy)
+                command_flag, request_policy
+            )
 
             policy_cb = self._policies_callback_mapping[request_policy]
             if nodes_flag is None and command == arg0:
@@ -1750,7 +1760,8 @@ class RedisCluster(
                 self.nodes_manager.move_node_to_end_of_cached_nodes(target_node.name)
 
                 # DON'T set redis_connection = None - keep the pool for reuse
-                self.nodes_manager.initialize()
+                # provide the name of the failed node so we can try it last
+                self.nodes_manager.initialize(last_failed_node_name=target_node.name)
                 self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,
@@ -2296,11 +2307,7 @@ class NodesManager:
             node_idx = self.read_load_balancer.get_server_index(
                 primary_name, len(slot_info), load_balancing_strategy
             )
-        elif (
-            server_type is None
-            or server_type == PRIMARY
-            or len(slot_info) == 1
-        ):
+        elif server_type is None or server_type == PRIMARY or len(slot_info) == 1:
             # return a primary
             node_idx = 0
         else:
@@ -2450,6 +2457,7 @@ class NodesManager:
         self,
         additional_startup_nodes_info: Optional[List[Tuple[str, int]]] = None,
         disconnect_startup_nodes_pools: bool = True,
+        last_failed_node_name: Optional[str] = None,
     ):
         """
         Initializes the nodes cache, slots cache and redis connections.
@@ -2469,6 +2477,9 @@ class NodesManager:
             with them.
             The format of the list is a list of tuples, where each tuple contains
             the host and port of the node.
+        :last_failed_node_name:
+            Name of the node that just failed and should be tried only after
+            other startup and additional startup nodes during this refresh.
         """
         self.reset()
         tmp_nodes_cache = {}
@@ -2490,18 +2501,39 @@ class NodesManager:
                     return
 
             with self._lock:
-                startup_nodes = tuple(self.startup_nodes.values())
+                startup_nodes = list(self.startup_nodes.values())
+            deferred_failed_nodes = []
+            if last_failed_node_name is not None:
+                for index, node in enumerate(startup_nodes):
+                    if node.name == last_failed_node_name:
+                        deferred_failed_nodes.append(startup_nodes.pop(index))
+                        break
+            if len(startup_nodes) > 1:
+                # Vary which startup node is queried first so clients do not
+                # all reinitialize through the same node.
+                random.shuffle(startup_nodes)
 
             additional_startup_nodes = [
                 ClusterNode(host, port) for host, port in additional_startup_nodes_info
             ]
+            if last_failed_node_name is not None:
+                for index, node in enumerate(additional_startup_nodes):
+                    if node.name == last_failed_node_name:
+                        if not deferred_failed_nodes:
+                            deferred_failed_nodes.append(node)
+                        additional_startup_nodes.pop(index)
+                        break
             if is_debug_log_enabled():
                 logger.debug(
                     f"Topology refresh: using additional nodes: {[node.name for node in additional_startup_nodes]}; "
                     f"and startup nodes: {[node.name for node in startup_nodes]}"
                 )
 
-            for startup_node in (*startup_nodes, *additional_startup_nodes):
+            for startup_node in chain(
+                startup_nodes,
+                additional_startup_nodes,
+                deferred_failed_nodes,
+            ):
                 try:
                     if startup_node.redis_connection:
                         r = startup_node.redis_connection
@@ -3050,11 +3082,17 @@ class ClusterPubSub(PubSub):
                 return None
         return message
 
-    def ssubscribe(self, *args, **kwargs):
-        if args:
-            args = list_or_args(args[0], args[1:])
-        s_channels = dict.fromkeys(args)
-        s_channels.update(kwargs)
+    def ssubscribe(
+        self, *args: ChannelT | Subscription, **kwargs: PubSubHandler
+    ) -> None:
+        """
+        Subscribe to shard channels.
+
+        Channels supplied as keyword arguments expect a channel name as the key
+        and a callable as the value. ``Subscription`` objects can also be
+        supplied positionally with an optional handler.
+        """
+        s_channels = parse_pubsub_subscriptions(args, kwargs)
         # Serialize against reinitialize_shard_subscriptions (worker thread)
         # so the reverse index, shard_channels, and node_pubsub_mapping are
         # not mutated concurrently.
@@ -3081,7 +3119,7 @@ class ClusterPubSub(PubSub):
                     continue
                 pubsub = self._get_node_pubsub(node)
                 if handler:
-                    pubsub.ssubscribe(**{s_channel: handler})
+                    pubsub.ssubscribe(Subscription(s_channel, handler))
                 else:
                     pubsub.ssubscribe(s_channel)
                 self.shard_channels.update(pubsub.shard_channels)
@@ -3229,12 +3267,7 @@ class ClusterPubSub(PubSub):
         # a text key only when we must pass it as a kwarg (handler present).
         new_pubsub = self._get_node_pubsub(new_node)
         if handler:
-            decoded = (
-                self.encoder.decode(channel, force=True)
-                if isinstance(channel, (bytes, bytearray))
-                else channel
-            )
-            new_pubsub.ssubscribe(**{decoded: handler})
+            new_pubsub.ssubscribe(Subscription(channel, handler))
         else:
             new_pubsub.ssubscribe(channel)
         self.shard_channels.update(new_pubsub.shard_channels)
@@ -3457,20 +3490,27 @@ class ClusterPipeline(RedisCluster):
             RequestPolicy.DEFAULT_KEYLESS: lambda self, command, *args, **kwargs: [
                 self.get_random_primary_or_all_nodes(command)
             ],
-            RequestPolicy.DEFAULT_KEYED: lambda self, command, *args, **kwargs:
-                self.get_nodes_from_slot(command, *args),
-            RequestPolicy.DEFAULT_NODE: lambda self, command, *args, **kwargs:
-                [self.get_default_node()],
-            RequestPolicy.ALL_SHARDS: lambda self, command, *args, **kwargs:
-                self.get_primaries(),
-            RequestPolicy.ALL_NODES: lambda self, command, *args, **kwargs:
-                self.get_nodes(),
-            RequestPolicy.ALL_REPLICAS: lambda self, command, *args, **kwargs:
-                self.get_replicas(),
-            RequestPolicy.MULTI_SHARD: lambda self, command, *args, **kwargs:
-                self._split_multi_shard_command(*args, **kwargs),
-            RequestPolicy.SPECIAL: lambda self, command, *args, **kwargs:
-                self.get_special_nodes(),
+            RequestPolicy.DEFAULT_KEYED: lambda self, command, *args, **kwargs: (
+                self.get_nodes_from_slot(command, *args)
+            ),
+            RequestPolicy.DEFAULT_NODE: lambda self, command, *args, **kwargs: [
+                self.get_default_node()
+            ],
+            RequestPolicy.ALL_SHARDS: lambda self, command, *args, **kwargs: (
+                self.get_primaries()
+            ),
+            RequestPolicy.ALL_NODES: lambda self, command, *args, **kwargs: (
+                self.get_nodes()
+            ),
+            RequestPolicy.ALL_REPLICAS: lambda self, command, *args, **kwargs: (
+                self.get_replicas()
+            ),
+            RequestPolicy.MULTI_SHARD: lambda self, command, *args, **kwargs: (
+                self._split_multi_shard_command(*args, **kwargs)
+            ),
+            RequestPolicy.SPECIAL: lambda self, command, *args, **kwargs: (
+                self.get_special_nodes()
+            ),
             ResponsePolicy.DEFAULT_KEYLESS: lambda res: res,
             ResponsePolicy.DEFAULT_KEYED: lambda res: res,
         }
@@ -4093,7 +4133,7 @@ class PipelineStrategy(AbstractStrategy):
         no_default_node = not pipe.get_default_node()
 
         policy_cache = {}
-        SENTINEL = object()
+        sentinel = object()
 
         try:
             # as we move through each command that still needs to be processed,
@@ -4103,11 +4143,9 @@ class PipelineStrategy(AbstractStrategy):
                 args = c.args
                 arg0 = args[0]
 
-                command_policies = policy_cache.get(arg0, SENTINEL)
-                if command_policies is SENTINEL:
-                    command_policies = policy_resolver.resolve(
-                        arg0.lower()
-                    )
+                command_policies = policy_cache.get(arg0, sentinel)
+                if command_policies is sentinel:
+                    command_policies = policy_resolver.resolve(arg0.lower())
                     policy_cache[arg0] = command_policies
 
                 # refer to our internal node -> slot table that
@@ -4142,7 +4180,10 @@ class PipelineStrategy(AbstractStrategy):
                                 command_policies = default_keyless
                             else:
                                 command_policies = default_keyed
-                                if command == arg0 and pipe.commands_parser._is_keyed_command(*args):
+                                if (
+                                    command == arg0
+                                    and pipe.commands_parser._is_keyed_command(*args)
+                                ):
                                     # safe to cache
                                     policy_cache[arg0] = command_policies
                         else:
@@ -4166,9 +4207,7 @@ class PipelineStrategy(AbstractStrategy):
                         )
                 c.command_policies = command_policies
                 if len(target_nodes) > 1:
-                    raise RedisClusterException(
-                        f"Too many targets for command {args}"
-                    )
+                    raise RedisClusterException(f"Too many targets for command {args}")
 
                 node = target_nodes[0]
                 if node == pipe.get_default_node():
@@ -4213,8 +4252,7 @@ class PipelineStrategy(AbstractStrategy):
             start_time = time.monotonic()
 
             writers = [
-                [iter(n.cowrite()), n, node_name]
-                for node_name, n in nodes.items()
+                [iter(n.cowrite()), n, node_name] for node_name, n in nodes.items()
             ]
             while writers:
                 writers_cycle = iter(cycle(writers))
@@ -4329,11 +4367,7 @@ class PipelineStrategy(AbstractStrategy):
                 c.options.pop("keys", None)
                 c.result = pipe._policies_callback_mapping[
                     c.command_policies.response_policy
-                ](
-                    pipe.cluster_response_callbacks[c.args[0]](
-                        c.result, **c.options
-                    )
-                )
+                ](pipe.cluster_response_callbacks[c.args[0]](c.result, **c.options))
             response.append(c.result)
 
         if raise_on_error:
@@ -4378,10 +4412,7 @@ class PipelineStrategy(AbstractStrategy):
             policy_cb = None
         if policy_cb is None:
             command = arg0.upper()
-            if (
-                len(args) >= 2
-                and f"{arg0} {args[1]}".upper() in pipe.command_flags
-            ):
+            if len(args) >= 2 and f"{arg0} {args[1]}".upper() in pipe.command_flags:
                 command = f"{arg0} {args[1]}".upper()
 
             if nodes_flag is not None:
@@ -4392,7 +4423,8 @@ class PipelineStrategy(AbstractStrategy):
                 command_flag = pipe.command_flags.get(command)
 
             request_policy = pipe._command_flags_mapping.get(
-                command_flag, request_policy)
+                command_flag, request_policy
+            )
             policy_cb = pipe._policies_callback_mapping[request_policy]
 
             if nodes_flag is None and command == arg0:
