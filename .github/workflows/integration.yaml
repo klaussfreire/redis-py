@@ -19,6 +19,7 @@ on:
       - tcp_multiplex
       - tcp_read_multiplex
       - micro_opt
+      - cluster_lockless
   schedule:
     - cron: '0 1 * * *' # nightly build
 
