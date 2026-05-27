@@ -121,6 +121,13 @@ try:
 except ValueError:
     SC_IOV_MAX = 0
 
+if hasattr(socket, "MSG_MORE"):
+    MSG_MORE = socket.MSG_MORE
+else:
+    # The OS does not support MSG_MORE, set it to 0
+    # to use neutral flags instead
+    MSG_MORE = 0
+
 
 class HiredisRespSerializer:
     def pack(self, *args: List):
@@ -1327,7 +1334,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 # Send in blocks of up to blocksz buffers using sendmsg
                 icommand = iter(command)
                 block = []
-                flags = socket.MSG_MORE
+                flags = MSG_MORE
                 while True:
                     blocklen = len(block)
                     if blocklen < blocksz:
@@ -1374,7 +1381,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 # length could be inaccurate so don't count on it
                 # split along ncommand - 1 in a way that it works
                 # whether it's the true last command or not
-                flags = socket.MSG_MORE
+                flags = MSG_MORE
                 icommand = iter(command)
                 if ncommand:
                     for pos, item in enumerate(islice(icommand, ncommand - 1), 1):
