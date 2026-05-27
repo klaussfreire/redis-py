@@ -117,9 +117,10 @@ else:
     DefaultParser = _RESP2Parser
 
 try:
-    SC_IOV_MAX = os.sysconf('SC_IOV_MAX')
+    SC_IOV_MAX = os.sysconf("SC_IOV_MAX")
 except ValueError:
     SC_IOV_MAX = 0
+
 
 class HiredisRespSerializer:
     def pack(self, *args: List):
@@ -1305,7 +1306,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 ncommand = 1
             else:
                 ncommand = len(command)
-            if ncommand and hasattr(sock, 'sendmsg'):
+            if ncommand and hasattr(sock, "sendmsg"):
                 msgblock = min(512, SC_IOV_MAX)
                 if msgblock and ncommand > 4:
                     # use iovec for lower overhead on large pipelines
@@ -1313,7 +1314,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                         flags = 0
                     else:
                         flags = socket.MSG_MORE
-                    sent = sock.sendmsg(islice(command, msgblock), (), flags)
+                    sent = sock.sendmsg(
+                        islice(command, msgblock), (), flags
+                    )
                     lastblock = ncommand - msgblock
                     lastpos = ncommand - 1
                     for pos, item in enumerate(command):
