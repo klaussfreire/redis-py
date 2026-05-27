@@ -16,6 +16,8 @@ on:
       - '[0-9].[0-9]-j'
       - '[0-9].[0-9]-j-next'
       - tcp_cork
+      - tcp_multiplex
+      - tcp_read_multiplex
   schedule:
     - cron: '0 1 * * *' # nightly build
 
