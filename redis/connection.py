@@ -1343,8 +1343,8 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                     if blocklen == 0:
                         break
                     elif blocklen < blocksz:
-                        # if the block is smaller than the block size, it's the last block
-                        # so we don't need to set MSG_MORE
+                        # if the block is smaller than the block size,
+                        # it's the last block so we don't need to set MSG_MORE
                         flags = 0
 
                     sent = sock.sendmsg(block, (), flags)
