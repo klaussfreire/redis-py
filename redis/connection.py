@@ -121,6 +121,13 @@ try:
 except ValueError:
     SC_IOV_MAX = 0
 
+if hasattr(socket, "MSG_MORE"):
+    MSG_MORE = socket.MSG_MORE
+else:
+    # The OS does not support MSG_MORE, set it to 0
+    # to use neutral flags instead
+    MSG_MORE = 0
+
 
 class HiredisRespSerializer:
     def pack(self, *args: List):
@@ -1313,7 +1320,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                     if msgblock >= ncommand:
                         flags = 0
                     else:
-                        flags = socket.MSG_MORE
+                        flags = MSG_MORE
                     sent = sock.sendmsg(
                         islice(command, msgblock), (), flags
                     )
@@ -1344,7 +1351,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                             sent = 0
                 else:
                     # regular corked sendall
-                    flags = socket.MSG_MORE
+                    flags = MSG_MORE
                     for item in command[:-1]:
                         sock.sendall(item, flags)
                     sock.sendall(command[-1])
