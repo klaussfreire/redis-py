@@ -246,7 +246,7 @@ async def main(loop, gather=None):
 
 if __name__ == "__main__":
     host = "localhost"
-    port = 16379
+    port = 6379
     password = None
 
     count = 10000
