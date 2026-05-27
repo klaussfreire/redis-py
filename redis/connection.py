@@ -132,10 +132,7 @@ else:
 class HiredisRespSerializer:
     def pack(self, *args: List):
         """Pack a series of arguments into the Redis protocol"""
-        args = tuple(
-            bytes(arg) if isinstance(arg, bytearray) else arg
-            for arg in args
-        )
+        args = tuple(bytes(arg) if isinstance(arg, bytearray) else arg for arg in args)
         arg0 = args[0]
         if isinstance(arg0, str):
             args = tuple(arg0.encode().split()) + args[1:]
