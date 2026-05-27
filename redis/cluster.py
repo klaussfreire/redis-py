@@ -2292,11 +2292,7 @@ class NodesManager:
             node_idx = self.read_load_balancer.get_server_index(
                 primary_name, len(slot_info), load_balancing_strategy
             )
-        elif (
-            server_type is None
-            or server_type == PRIMARY
-            or len(slot_info) == 1
-        ):
+        elif server_type is None or server_type == PRIMARY or len(slot_info) == 1:
             # return a primary
             node_idx = 0
         else:
