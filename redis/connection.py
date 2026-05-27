@@ -1312,7 +1312,7 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             sock = self._sock
             if isinstance(command, (str, bytes)):
                 command = [command]
-                ncommand == 1
+                ncommand = 1
             elif isinstance(command, list):
                 ncommand = len(command)
             else:

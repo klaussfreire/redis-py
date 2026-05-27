@@ -7,7 +7,6 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from functools import wraps
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, TypeVar, Union
-from itertools import islice
 
 from redis.exceptions import DataError
 from redis.typing import AbsExpiryT, EncodableT, ExpiryT
