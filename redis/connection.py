@@ -1317,6 +1317,8 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             else:
                 ncommand = None
             blocksz = min(maxblock, SC_IOV_MAX)
+            if not hasattr(sock, "sendmsg"):
+                blocksz = 1
             yield_every = max(1, sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2)
             unyielded_bytes = 0
 
