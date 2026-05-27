@@ -1313,8 +1313,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 ncommand = 1
             else:
                 ncommand = len(command)
-            if ncommand and hasattr(sock, "sendmsg"):
+            if ncommand:
                 msgblock = min(512, SC_IOV_MAX)
+                if not hasattr(sock, "sendmsg"):
+                    msgblock = 0
                 if msgblock and ncommand > 4:
                     # use iovec for lower overhead on large pipelines
                     if msgblock >= ncommand:
