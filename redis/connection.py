@@ -266,8 +266,7 @@ class ConnectionInterface:
 
     @abstractmethod
     def gen_packed_commands(self, commands):
-        return
-        yield
+        yield from ()
 
     @property
     @abstractmethod
