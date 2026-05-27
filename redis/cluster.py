@@ -3789,6 +3789,11 @@ class NodeCommands:
             for c in commands:
                 c.result = e
 
+    def buffer_responses(self):
+        connection = self.connection
+        while connection.buffer_response():
+            pass
+
     def read(self):
         """ """
         connection = self.connection
@@ -4262,6 +4267,9 @@ class PipelineStrategy(AbstractStrategy):
                     except StopIteration:
                         nodes_written += 1
                         wgencell[0] = None
+                    else:
+                        # read from socket if there's data to unblock the server
+                        wgencell[1].buffer_responses()
                 writers = [wgencell for wgencell in writers if wgencell[0] is not None]
 
             for node_name, n in nodes.items():
