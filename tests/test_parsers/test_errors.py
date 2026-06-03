@@ -117,6 +117,15 @@ class MockSocket:
     def shutdown(self, how):
         pass
 
+    __sockopts = {
+        socket.SOL_SOCKET: {
+            socket.SO_SNDBUF: 200 * 1024,
+        }
+    }
+
+    def getsockopt(self, level, optname):
+        return self.__sockopts.get(level, {}).get(optname)
+
 
 @pytest.mark.fixed_client
 class TestErrorParsing:

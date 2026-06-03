@@ -267,6 +267,10 @@ class ConnectionInterface:
     def pack_commands(self, commands):
         pass
 
+    @abstractmethod
+    def gen_packed_commands(self, commands):
+        yield from ()
+
     @property
     @abstractmethod
     def handshake_metadata(self) -> Union[Dict[bytes, bytes], Dict[str, str]]:
@@ -1302,7 +1306,11 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 with_failure_count=True,
             )
 
-    def send_packed_command(self, command, check_health=True):
+    def send_packed_command(self, command, check_health=True, maxblock=768):
+        for _ in self.cosend_packed_command(command, check_health, maxblock):
+            pass
+
+    def cosend_packed_command(self, command, check_health=True, maxblock=768):
         """Send an already packed command to the Redis server"""
         if not self._sock:
             self.connect_check_health(check_health=False)
@@ -1311,55 +1319,88 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
             self.check_health()
         try:
             sock = self._sock
-            if isinstance(command, str):
+            if isinstance(command, (str, bytes)):
                 command = [command]
                 ncommand = 1
-            else:
+            elif isinstance(command, list):
                 ncommand = len(command)
-            if ncommand:
-                msgblock = min(512, SC_IOV_MAX)
-                if not hasattr(sock, "sendmsg"):
-                    msgblock = 0
-                if msgblock and ncommand > 4:
-                    # use iovec for lower overhead on large pipelines
-                    if msgblock >= ncommand:
+            else:
+                ncommand = None
+            blocksz = min(maxblock, SC_IOV_MAX)
+            if not hasattr(sock, "sendmsg"):
+                blocksz = 1
+            yield_every = sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF)
+            unyielded_bytes = 0
+            blocksz = min(blocksz, max(32, yield_every // self._buffer_cutoff))
+            if blocksz > 16 and (ncommand is None or ncommand > 4):
+                # Send in blocks of up to blocksz buffers using sendmsg
+                icommand = iter(command)
+                block = []
+                flags = MSG_MORE
+                while True:
+                    blocklen = len(block)
+                    if blocklen < blocksz:
+                        block.extend(islice(icommand, blocksz - blocklen))
+                        blocklen = len(block)
+                    if blocklen == 0:
+                        break
+                    elif blocklen < blocksz:
+                        # if the block is smaller than the block size,
+                        # it's the last block so we don't need to set MSG_MORE
                         flags = 0
-                    else:
-                        flags = MSG_MORE
-                    sent = sock.sendmsg(islice(command, msgblock), (), flags)
-                    lastblock = ncommand - msgblock
-                    lastpos = ncommand - 1
-                    for pos, item in enumerate(command):
+
+                    sent = sock.sendmsg(block, (), flags)
+
+                    unyielded_bytes += sent
+                    if unyielded_bytes >= yield_every:
+                        unyielded_bytes = 0
+                        yield
+
+                    for pos, item in enumerate(block):
                         itemlen = len(item)
                         if sent >= itemlen:
                             sent -= itemlen
                             continue
-                        elif sent == 0:
-                            # send another block
-                            if pos >= lastblock:
-                                flags = 0
-                            sent = sock.sendmsg(
-                                islice(command, pos, pos + msgblock), (), flags
-                            )
-                            if sent >= itemlen:
-                                sent -= itemlen
-                                continue
-                        if sent and sent < itemlen:
+
+                        if sent > 0:
                             # partial send, finish the buffer with sendall in case
                             # it's really big where sendall is more efficient
                             if not isinstance(item, memoryview):
                                 item = memoryview(item)
-                            if pos >= lastpos:
-                                flags = 0
                             item = item[sent:]
-                            sock.sendall(item, flags)
-                            sent = 0
-                else:
-                    # regular corked sendall
-                    flags = MSG_MORE
-                    for item in command[:-1]:
+                            del block[:pos]
+                            block[0] = item
+                        else:
+                            del block[: pos + 1]
+                        break
+                    else:
+                        del block[:]
+                if flags:
+                    # Un-cork if we corked the last block
+                    sock.send(b"")
+            else:
+                # regular corked sendall
+                # length could be inaccurate so don't count on it
+                # split along ncommand - 1 in a way that it works
+                # whether it's the true last command or not
+                flags = MSG_MORE
+                icommand = iter(command)
+                if ncommand:
+                    for pos, item in enumerate(islice(icommand, ncommand - 1), 1):
                         sock.sendall(item, flags)
-                    sock.sendall(command[-1])
+                        if pos % maxblock == 0:
+                            yield
+                else:
+                    for pos, item in enumerate(icommand, 1):
+                        sock.sendall(item, flags)
+                        if pos % maxblock == 0:
+                            yield
+                for item in icommand:
+                    flags = 0
+                    sock.sendall(item)
+                if flags:
+                    # Un-cork if we corked the last item
+                    sock.send(b"")
         except socket.timeout:
             self.disconnect()
             raise TimeoutError("Timeout writing to socket")
@@ -1457,8 +1498,10 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         return self._command_packer.pack(*args)
 
     def pack_commands(self, commands):
+        return list(self.gen_packed_commands(commands))
+
+    def gen_packed_commands(self, commands):
         """Pack multiple commands into the Redis protocol"""
-        output = []
         pieces = []
         buffer_length = 0
         buffer_cutoff = self._buffer_cutoff
@@ -1472,19 +1515,18 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                     or isinstance(chunk, memoryview)
                 ):
                     if pieces:
-                        output.append(SYM_EMPTY.join(pieces))
+                        yield SYM_EMPTY.join(pieces)
                     buffer_length = 0
                     pieces = []
 
                 if chunklen > buffer_cutoff or isinstance(chunk, memoryview):
-                    output.append(chunk)
+                    yield chunk
                 else:
                     pieces.append(chunk)
                     buffer_length += chunklen
 
         if pieces:
-            output.append(SYM_EMPTY.join(pieces))
-        return output
+            yield SYM_EMPTY.join(pieces)
 
     def get_protocol(self) -> Union[int, str]:
         return self.protocol
@@ -1869,6 +1911,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def pack_commands(self, commands):
         return self._conn.pack_commands(commands)
+
+    def gen_packed_commands(self, commands):
+        return self._conn.gen_packed_commands(commands)
 
     @property
     def handshake_metadata(self) -> Union[Dict[bytes, bytes], Dict[str, str]]:
