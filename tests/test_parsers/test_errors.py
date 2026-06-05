@@ -49,7 +49,7 @@ class MockSocket:
         """Simulate sending all data to Redis."""
         return self.send(data)
 
-    def recv(self, bufsize):
+    def recv(self, bufsize, flags=0):
         """Simulate receiving data from Redis."""
         if self.closed:
             raise ConnectionError("Socket is closed")
@@ -65,7 +65,7 @@ class MockSocket:
 
             raise BlockingIOError(errno.EAGAIN, "Resource temporarily unavailable")
 
-    def recv_into(self, buffer, nbytes=0):
+    def recv_into(self, buffer, nbytes=0, flags=0):
         """
         Receive data from Redis and write it into the provided buffer.
         Returns the number of bytes written.
@@ -116,6 +116,15 @@ class MockSocket:
 
     def shutdown(self, how):
         pass
+
+    __sockopts = {
+        socket.SOL_SOCKET: {
+            socket.SO_SNDBUF: 200 * 1024,
+        }
+    }
+
+    def getsockopt(self, level, optname):
+        return self.__sockopts.get(level, {}).get(optname)
 
 
 @pytest.mark.fixed_client

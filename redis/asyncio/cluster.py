@@ -1675,18 +1675,11 @@ class ClusterNode:
             # Release connection
             self.release(connection)
 
-    async def execute_pipeline(self, commands: List["PipelineCommand"]) -> bool:
-        # Acquire connection
-        connection = self.acquire_connection()
-        # Handle lazy disconnect for connections marked for reconnect
-        await self.disconnect_if_needed(connection)
-
-        # Execute command
-        await connection.send_packed_command(
-            connection.pack_commands(cmd.args for cmd in commands)
-        )
-
-        # Read responses
+    async def _parse_pipeline_responses(
+        self,
+        connection: Connection,
+        commands: List["PipelineCommand"],
+    ) -> bool:
         ret = False
         for cmd in commands:
             try:
@@ -1696,6 +1689,26 @@ class ClusterNode:
             except Exception as e:
                 cmd.result = e
                 ret = True
+        return ret
+
+    async def execute_pipeline(self, commands: List["PipelineCommand"]) -> bool:
+        # Acquire connection
+        connection = self.acquire_connection()
+        # Handle lazy disconnect for connections marked for reconnect
+        await self.disconnect_if_needed(connection)
+
+        # Connect prior to sending/receiving pipeline commands to ensure
+        # each concurrent coroutine doesn't have to reconnect
+        if not connection.is_connected:
+            await connection.connect_check_health(check_health=False)
+
+        # Execute command
+        _, ret = await asyncio.gather(
+            connection.send_packed_command(
+                connection.gen_packed_commands(cmd.args for cmd in commands)
+            ),
+            self._parse_pipeline_responses(connection, commands),
+        )
 
         # Release connection
         await self.disconnect_if_needed(connection)

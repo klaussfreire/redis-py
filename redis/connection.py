@@ -6,7 +6,7 @@ import threading
 import time
 import weakref
 from abc import ABC, abstractmethod
-from itertools import chain
+from itertools import chain, islice
 from queue import Empty, Full, LifoQueue
 from typing import (
     Any,
@@ -107,6 +107,8 @@ SYM_STAR = b"*"
 SYM_DOLLAR = b"$"
 SYM_CRLF = b"\r\n"
 SYM_EMPTY = b""
+SYM_SPACE = b" "
+BYTE_SPACE = SYM_SPACE[0]
 
 DefaultParser: Type[Union[_RESP2Parser, _RESP3Parser, _HiredisParser]]
 if HIREDIS_AVAILABLE:
@@ -114,27 +116,33 @@ if HIREDIS_AVAILABLE:
 else:
     DefaultParser = _RESP2Parser
 
+try:
+    SC_IOV_MAX = os.sysconf("SC_IOV_MAX")
+except ValueError:
+    SC_IOV_MAX = 0
+
+if hasattr(socket, "MSG_MORE"):
+    MSG_MORE = socket.MSG_MORE
+else:
+    # The OS does not support MSG_MORE, set it to 0
+    # to use neutral flags instead
+    MSG_MORE = 0
+
 
 class HiredisRespSerializer:
     def pack(self, *args: List):
         """Pack a series of arguments into the Redis protocol"""
-        output = []
-
-        if isinstance(args[0], str):
-            args = tuple(args[0].encode().split()) + args[1:]
-        elif b" " in args[0]:
-            args = tuple(args[0].split()) + args[1:]
-        args = tuple(
-            bytes(arg) if isinstance(arg, (bytearray, memoryview)) else arg
-            for arg in args
-        )
+        args = tuple(bytes(arg) if isinstance(arg, bytearray) else arg for arg in args)
+        arg0 = args[0]
+        if isinstance(arg0, str):
+            args = tuple(arg0.encode().split()) + args[1:]
+        elif BYTE_SPACE in arg0:
+            args = tuple(arg0.split()) + args[1:]
         try:
-            output.append(hiredis.pack_command(args))
+            return [hiredis.pack_command(args)]
         except TypeError:
             _, value, traceback = sys.exc_info()
             raise DataError(value).with_traceback(traceback)
-
-        return output
 
 
 class PythonRespSerializer:
@@ -150,10 +158,11 @@ class PythonRespSerializer:
         # arguments to be sent separately, so split the first argument
         # manually. These arguments should be bytestrings so that they are
         # not encoded.
-        if isinstance(args[0], str):
-            args = tuple(args[0].encode().split()) + args[1:]
-        elif b" " in args[0]:
-            args = tuple(args[0].split()) + args[1:]
+        arg0 = args[0]
+        if isinstance(arg0, str):
+            args = tuple(arg0.encode().split()) + args[1:]
+        elif BYTE_SPACE in arg0:
+            args = tuple(arg0.split()) + args[1:]
 
         buff = SYM_EMPTY.join((SYM_STAR, str(len(args)).encode(), SYM_CRLF))
 
@@ -257,6 +266,10 @@ class ConnectionInterface:
     @abstractmethod
     def pack_commands(self, commands):
         pass
+
+    @abstractmethod
+    def gen_packed_commands(self, commands):
+        yield from ()
 
     @property
     @abstractmethod
@@ -1293,7 +1306,11 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                 with_failure_count=True,
             )
 
-    def send_packed_command(self, command, check_health=True):
+    def send_packed_command(self, command, check_health=True, maxblock=768):
+        for _ in self.cosend_packed_command(command, check_health, maxblock):
+            pass
+
+    def cosend_packed_command(self, command, check_health=True, maxblock=768):
         """Send an already packed command to the Redis server"""
         if not self._sock:
             self.connect_check_health(check_health=False)
@@ -1301,10 +1318,160 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         if check_health:
             self.check_health()
         try:
-            if isinstance(command, str):
+            sock = self._sock
+            if isinstance(command, (str, bytes)):
                 command = [command]
-            for item in command:
-                self._sock.sendall(item)
+                ncommand = 1
+            elif isinstance(command, list):
+                ncommand = len(command)
+            else:
+                ncommand = None
+            blocksz = min(maxblock, SC_IOV_MAX)
+            if not hasattr(sock, "sendmsg"):
+                blocksz = 1
+            yield_every = max(
+                1, sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2
+            )
+            unyielded_bytes = 0
+
+            # On the rationale of the above computation.
+            #
+            # We send data from the app to the kernel socket in batches of blocksz
+            # buffers of roughly _buffer_cutoff bytes each.
+            #
+            # That socket buffer has up to SO_SNDBUF bytes, so if we write that
+            # amount rightaway we'll start blocking.
+            #
+            # As soon as we write, data starts being transmitted to the server,
+            # where it will be queued in another socket's read buffer.
+            # That socket has up to SO_RCVBUF (of the other system, we don't know how much)
+            # Before the server has a chance to read much off of that buffer,
+            # we will try to write another batch. If our buffer hasn't cleared,
+            # we'll block.
+            #
+            # If we sent SO_SNDBUF now, and send another SO_SNDBUF again,
+            # we're right on the edge, assuming the server has a similar SNDBUF.
+            # Given how the logic is implemented, we can end up sending buffers
+            # slightly above the blocksz limit computed here, so we need some margin.
+            #
+            # Taking half the computed limit gives us that margin, and also ensures
+            # that we won't block on the second call to write
+            # (we have enough buffer to avoid blocking).
+            #
+            # After the second call, we'll read from the socket
+            # (with buffer_response), so we'll unblock the server and we'll be free
+            # to send another chunk next time.
+            #
+            # This assumes the server has some buffering too, if we want to be fully
+            # safe even if the server has a tiny buffer, we can do // 3, but in all
+            # the testing done // 2 seems OK in general if the server also buffers.
+            #
+            # Counting bytes after sendmsg is unavoidable, sendmsg doesn't guarantee
+            # all buffers will get sent fully on TCP connections, so we need to check
+            # how many bytes and buffers were actually sent and adjust accordingly.
+            # Doing this is still a win compared to joining the buffers and using sendall
+            # as it avoids extra copying and allocations.
+            #
+            # NOTE:
+            #
+            # The only place where that logic breaks, is if the server responses
+            # are disproportionately big compared to our requests. That can happen
+            # if we get very big response values in a big pipeline, but that's hard
+            # to prepare for without a nonblocking I/O loop.
+            #
+            # In that case, we can get blocked on a third write, before the server
+            # sent the first reply, and we'll never do the buffer_response call
+            # to unblock the server when it fills its buffer, ending in a deadlock.
+
+            if blocksz > 16 and (ncommand is None or ncommand > 4):
+                # Send in blocks of up to blocksz buffers using sendmsg
+                icommand = iter(command)
+                block = []
+                blockbytes = 0
+                maxblockbytes = yield_every
+                flags = MSG_MORE
+                while True:
+                    blocklen = len(block)
+                    if blocklen < blocksz:
+                        blocktgtbytes = min(
+                            maxblockbytes, yield_every - unyielded_bytes
+                        )
+                        if blockbytes < maxblockbytes:
+                            for buf in islice(icommand, blocksz - blocklen):
+                                block.append(buf)
+                                blockbytes += len(buf)
+                                if blockbytes >= blocktgtbytes:
+                                    break
+                            else:
+                                if len(block) < blocksz:
+                                    # We reached the end of the commands iterator
+                                    flags = 0
+                        blocklen = len(block)
+                    if blocklen == 0:
+                        break
+
+                    sent = sock.sendmsg(block, (), flags)
+
+                    unyielded_bytes += sent
+                    if unyielded_bytes >= yield_every:
+                        unyielded_bytes = 0
+                        yield
+
+                    if sent == blockbytes:
+                        # full send
+                        del block[:]
+                        blockbytes = 0
+                    else:
+                        # partial send, figure what data has been sent and take it out
+                        for pos, item in enumerate(block):
+                            itemlen = len(item)
+                            if sent >= itemlen:
+                                sent -= itemlen
+                                continue
+
+                            if sent > 0:
+                                # partial buffer send, slice it in memoryview form
+                                if not isinstance(item, memoryview):
+                                    item = memoryview(item)
+                                item = item[sent:]
+                                del block[:pos]
+                                block[0] = item
+                            else:
+                                del block[: pos + 1]
+                            break
+                        else:
+                            del block[:]
+                        blockbytes = sum(map(len, block))
+                if flags:
+                    # Un-cork if we corked the last block
+                    sock.send(b"")
+            else:
+                # regular corked sendall
+                # length could be inaccurate so don't count on it
+                # split along ncommand - 1 in a way that it works
+                # whether it's the true last command or not
+                flags = MSG_MORE
+                icommand = iter(command)
+                if ncommand:
+                    for item in islice(icommand, ncommand - 1):
+                        sock.sendall(item, flags)
+                        unyielded_bytes += len(item)
+                        if unyielded_bytes >= yield_every:
+                            unyielded_bytes = 0
+                            yield
+                else:
+                    for item in icommand:
+                        sock.sendall(item, flags)
+                        unyielded_bytes += len(item)
+                        if unyielded_bytes >= yield_every:
+                            unyielded_bytes = 0
+                            yield
+                for item in icommand:
+                    flags = 0
+                    sock.sendall(item)
+                if flags:
+                    # Un-cork if we corked the last item
+                    sock.send(b"")
         except socket.timeout:
             self.disconnect()
             raise TimeoutError("Timeout writing to socket")
@@ -1347,6 +1514,9 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         except OSError as e:
             self.disconnect()
             raise ConnectionError(f"Error while reading from {host_error}: {e.args}")
+
+    def buffer_response(self):
+        return self._parser.read_from_socket(raise_on_timeout=False, nonblock=True)
 
     def read_response(
         self,
@@ -1402,14 +1572,17 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
         return self._command_packer.pack(*args)
 
     def pack_commands(self, commands):
+        return list(self.gen_packed_commands(commands))
+
+    def gen_packed_commands(self, commands):
         """Pack multiple commands into the Redis protocol"""
-        output = []
+        packer = self._command_packer
         pieces = []
         buffer_length = 0
         buffer_cutoff = self._buffer_cutoff
 
         for cmd in commands:
-            for chunk in self._command_packer.pack(*cmd):
+            for chunk in packer.pack(*cmd):
                 chunklen = len(chunk)
                 if (
                     buffer_length > buffer_cutoff
@@ -1417,19 +1590,18 @@ class AbstractConnection(MaintNotificationsAbstractConnection, ConnectionInterfa
                     or isinstance(chunk, memoryview)
                 ):
                     if pieces:
-                        output.append(SYM_EMPTY.join(pieces))
+                        yield SYM_EMPTY.join(pieces)
                     buffer_length = 0
                     pieces = []
 
                 if chunklen > buffer_cutoff or isinstance(chunk, memoryview):
-                    output.append(chunk)
+                    yield chunk
                 else:
                     pieces.append(chunk)
                     buffer_length += chunklen
 
         if pieces:
-            output.append(SYM_EMPTY.join(pieces))
-        return output
+            yield SYM_EMPTY.join(pieces)
 
     def get_protocol(self) -> Union[int, str]:
         return self.protocol
@@ -1814,6 +1986,9 @@ class CacheProxyConnection(MaintNotificationsAbstractConnection, ConnectionInter
 
     def pack_commands(self, commands):
         return self._conn.pack_commands(commands)
+
+    def gen_packed_commands(self, commands):
+        return self._conn.gen_packed_commands(commands)
 
     @property
     def handshake_metadata(self) -> Union[Dict[bytes, bytes], Dict[str, str]]:

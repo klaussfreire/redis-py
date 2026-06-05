@@ -10,7 +10,7 @@ from collections import OrderedDict, defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import copy
 from enum import Enum
-from itertools import chain
+from itertools import chain, cycle
 from types import MethodType
 from typing import (
     TYPE_CHECKING,
@@ -2289,32 +2289,33 @@ class NodesManager:
         if read_from_replicas is True and load_balancing_strategy is None:
             load_balancing_strategy = LoadBalancingStrategy.ROUND_ROBIN
 
-        with self._lock:
-            if self.slots_cache.get(slot) is None or len(self.slots_cache[slot]) == 0:
-                raise SlotNotCoveredError(
-                    f'Slot "{slot}" not covered by the cluster. '
-                    + f'"require_full_coverage={self._require_full_coverage}"'
-                )
+        # slot-infos are immutable (it's mutable, but never mutated,
+        # only replaced) so after getting a reference to the slot info,
+        # we can safely operate on it without lock
+        slots_cache = self.slots_cache
+        slot_info = slots_cache.get(slot)
 
-            if len(self.slots_cache[slot]) > 1 and load_balancing_strategy:
-                # get the server index using the strategy defined in load_balancing_strategy
-                primary_name = self.slots_cache[slot][0].name
-                node_idx = self.read_load_balancer.get_server_index(
-                    primary_name, len(self.slots_cache[slot]), load_balancing_strategy
-                )
-            elif (
-                server_type is None
-                or server_type == PRIMARY
-                or len(self.slots_cache[slot]) == 1
-            ):
-                # return a primary
-                node_idx = 0
-            else:
-                # return a replica
-                # randomly choose one of the replicas
-                node_idx = random.randint(1, len(self.slots_cache[slot]) - 1)
+        if slot_info is None or len(slot_info) == 0:
+            raise SlotNotCoveredError(
+                f'Slot "{slot}" not covered by the cluster. '
+                + f'"require_full_coverage={self._require_full_coverage}"'
+            )
 
-            return self.slots_cache[slot][node_idx]
+        if len(slot_info) > 1 and load_balancing_strategy:
+            # get the server index using the strategy defined in load_balancing_strategy
+            primary_name = slot_info[0].name
+            node_idx = self.read_load_balancer.get_server_index(
+                primary_name, len(slot_info), load_balancing_strategy
+            )
+        elif server_type is None or server_type == PRIMARY or len(slot_info) == 1:
+            # return a primary
+            node_idx = 0
+        else:
+            # return a replica
+            # randomly choose one of the replicas
+            node_idx = random.randint(1, len(slot_info) - 1)
+
+        return slot_info[node_idx]
 
     def get_nodes_by_server_type(self, server_type: Literal["primary", "replica"]):
         """
@@ -3763,6 +3764,10 @@ class NodeCommands:
         self.commands.append(c)
 
     def write(self):
+        for _ in self.cowrite():
+            pass
+
+    def cowrite(self):
         """
         Code borrowed from Redis so it can be fixed
         """
@@ -3777,12 +3782,17 @@ class NodeCommands:
         # build up all commands into a single request to increase network perf
         # send all the commands and catch connection and timeout errors.
         try:
-            connection.send_packed_command(
-                connection.pack_commands([c.args for c in commands])
+            yield from connection.cosend_packed_command(
+                connection.gen_packed_commands(c.args for c in commands),
             )
         except (ConnectionError, TimeoutError) as e:
             for c in commands:
                 c.result = e
+
+    def buffer_responses(self):
+        connection = self.connection
+        while connection.buffer_response():
+            pass
 
     def read(self):
         """ """
@@ -4108,6 +4118,7 @@ class PipelineStrategy(AbstractStrategy):
         nodes: dict[str, NodeCommands] = {}
         nodes_written = 0
         nodes_read = 0
+        dirty_nodes = set()
         pipe = self._pipe
 
         # commonly used policies for reuse
@@ -4240,12 +4251,28 @@ class PipelineStrategy(AbstractStrategy):
             # Start timing for observability
             start_time = time.monotonic()
 
-            node_commands = nodes.values()
-            for n in node_commands:
-                nodes_written += 1
-                n.write()
+            writers = [
+                [iter(n.cowrite()), n, node_name] for node_name, n in nodes.items()
+            ]
+            while writers:
+                writers_cycle = iter(cycle(writers))
+                for wgencell in writers_cycle:
+                    wgen, node, node_name = wgencell
+                    if wgen is None:
+                        # clean up writers cycle
+                        break
+                    try:
+                        dirty_nodes.add(node_name)
+                        _ = next(wgen)
+                    except StopIteration:
+                        nodes_written += 1
+                        wgencell[0] = None
+                    else:
+                        # read from socket if there's data to unblock the server
+                        wgencell[1].buffer_responses()
+                writers = [wgencell for wgencell in writers if wgencell[0] is not None]
 
-            for n in node_commands:
+            for node_name, n in nodes.items():
                 n.read()
 
                 # Find the first error in this node's commands, if any
@@ -4264,6 +4291,7 @@ class PipelineStrategy(AbstractStrategy):
                     error=node_error,
                 )
                 nodes_read += 1
+                dirty_nodes.discard(node_name)
         finally:
             # release all the redis connections we allocated earlier
             # back into the connection pool.
@@ -4278,9 +4306,10 @@ class PipelineStrategy(AbstractStrategy):
             # through nodes.values() in the same order as we are when
             # reading / writing to the connections above, which is critical
             # for how we're using the nodes_written/nodes_read offsets.
-            for i, n in enumerate(nodes.values()):
-                if i < nodes_written and i >= nodes_read:
-                    n.connection.disconnect()
+            for node_name in dirty_nodes:
+                n = nodes[node_name]
+                n.connection.disconnect()
+            for n in nodes.values():
                 n.connection_pool.release(n.connection)
 
         # if the response isn't an exception it is a

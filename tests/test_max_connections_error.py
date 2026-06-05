@@ -41,6 +41,10 @@ class DummyConnection(ConnectionInterface):
     def send_packed_command(self, command, check_health=True):
         pass
 
+    def cosend_packed_command(self, command, check_health=True):
+        return
+        yield
+
     def send_command(self, *args, **kwargs):
         pass
 
