@@ -260,6 +260,7 @@ def get_mocked_redis_client(
 def mock_node_resp(node, response):
     connection = Mock()
     connection.read_response.return_value = response
+    connection.buffer_response.return_value = False
     connection.cosend_packed_command.side_effect = lambda *p, **kw: iter([None])
     node.redis_connection.connection = connection
     return node
@@ -268,6 +269,7 @@ def mock_node_resp(node, response):
 def mock_node_resp_func(node, func):
     connection = Mock()
     connection.read_response.side_effect = func
+    connection.buffer_response.return_value = False
     connection.cosend_packed_command.side_effect = lambda *p, **kw: iter([None])
     node.redis_connection.connection = connection
     return node

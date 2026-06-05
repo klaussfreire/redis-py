@@ -45,16 +45,18 @@ class SocketBuffer:
         self._buffer.seek(pos)
         return end - pos
 
-    def _read_from_socket(
+    def read_from_socket(
         self,
         length: Optional[int] = None,
         timeout: Union[float, object] = SENTINEL,
         raise_on_timeout: Optional[bool] = True,
+        nonblock: bool = False,
     ) -> bool:
         sock = self._sock
         socket_read_size = self.socket_read_size
         marker = 0
         custom_timeout = timeout is not SENTINEL
+        flags = socket.MSG_DONTWAIT if nonblock else 0
 
         buf = self._buffer
         current_pos = buf.tell()
@@ -63,7 +65,7 @@ class SocketBuffer:
             sock.settimeout(timeout)
         try:
             while True:
-                data = sock.recv(socket_read_size)
+                data = sock.recv(socket_read_size, flags)
                 # an empty string indicates the server shutdown the socket
                 if isinstance(data, bytes) and len(data) == 0:
                     raise ConnectionError(SERVER_CLOSED_CONNECTION_ERROR)
@@ -96,8 +98,9 @@ class SocketBuffer:
                 sock.settimeout(self.socket_timeout)
 
     def can_read(self, timeout: float = 0) -> bool:
-        return bool(self.unread_bytes()) or self._read_from_socket(
-            timeout=timeout, raise_on_timeout=False
+        return bool(self.unread_bytes()) or self.read_from_socket(
+            timeout=timeout,
+            raise_on_timeout=False,
         )
 
     def read(self, length: int, timeout: Union[float, object] = SENTINEL) -> bytes:
@@ -107,7 +110,7 @@ class SocketBuffer:
         missing = length - len(data)
         if missing:
             # fill up the buffer and read the remainder
-            self._read_from_socket(length=missing, timeout=timeout)
+            self.read_from_socket(length=missing, timeout=timeout)
             data += self._buffer.read(missing)
         return data[:-2]
 
@@ -116,7 +119,7 @@ class SocketBuffer:
         data = buf.readline()
         while not data.endswith(SYM_CRLF):
             # there's more data in the socket that we need
-            self._read_from_socket(timeout=timeout)
+            self.read_from_socket(timeout=timeout)
             data += buf.readline()
 
         return data[:-2]

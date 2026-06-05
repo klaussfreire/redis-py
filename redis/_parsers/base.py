@@ -159,6 +159,12 @@ class _RESPBase(BaseParser):
             return False
         return self._buffer.can_read(timeout)
 
+    def read_from_socket(self, *p, **kw):
+        if self._buffer is not None:
+            return self._buffer.read_from_socket(*p, **kw)
+        else:
+            return False
+
 
 class AsyncBaseParser(BaseParser):
     """Base parsing class for the python-backed async parser"""
