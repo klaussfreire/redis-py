@@ -13,6 +13,7 @@ from types import MappingProxyType
 from typing import (
     Any,
     Callable,
+    Generator,
     Iterable,
     List,
     Mapping,
@@ -847,8 +848,12 @@ class AbstractConnection:
         return output
 
     def pack_commands(self, commands: Iterable[Iterable[EncodableT]]) -> List[bytes]:
+        return list(self.gen_packed_commands(commands))
+
+    def gen_packed_commands(
+        self, commands: Iterable[Iterable[EncodableT]]
+    ) -> Generator[bytes, None, None]:
         """Pack multiple commands into the Redis protocol"""
-        output: List[bytes] = []
         pieces: List[bytes] = []
         buffer_length = 0
         buffer_cutoff = self._buffer_cutoff
@@ -862,19 +867,18 @@ class AbstractConnection:
                     or isinstance(chunk, memoryview)
                 ):
                     if pieces:
-                        output.append(SYM_EMPTY.join(pieces))
+                        yield SYM_EMPTY.join(pieces)
                     buffer_length = 0
                     pieces = []
 
                 if chunklen > buffer_cutoff or isinstance(chunk, memoryview):
-                    output.append(chunk)
+                    yield chunk
                 else:
                     pieces.append(chunk)
                     buffer_length += chunklen
 
         if pieces:
-            output.append(SYM_EMPTY.join(pieces))
-        return output
+            yield SYM_EMPTY.join(pieces)
 
     def _socket_is_empty(self):
         """Check if the socket is empty"""
