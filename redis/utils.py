@@ -43,7 +43,9 @@ except ImportError:
 
 from importlib import metadata
 
-# Marker for omitted arguments. Compare by identity only.
+# Shared marker for omitted arguments, especially where None is a valid
+# explicit value. Import this object from redis.utils instead of creating local
+# sentinels, and compare it by identity only (`is` / `is not`).
 SENTINEL = object()
 
 
@@ -282,9 +284,9 @@ DEFAULT_RESP_VERSION = 3
 
 
 def check_protocol_version(
-    protocol: Optional[Union[str, int]], expected_version: int = 3
+    protocol: str | int | object | None, expected_version: int = 3
 ) -> bool:
-    if protocol is None:
+    if protocol is None or protocol is SENTINEL:
         protocol = DEFAULT_RESP_VERSION
     if isinstance(protocol, str):
         try:

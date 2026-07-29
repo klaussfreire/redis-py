@@ -9,6 +9,7 @@ from typing import (
     Any,
     Callable,
     Dict,
+    Iterable,
     List,
     Literal,
     Mapping,
@@ -18,6 +19,15 @@ from typing import (
     Union,
 )
 
+from redis import _himport_exec
+from redis._defaults import (
+    DEFAULT_RETRY_BASE,
+    DEFAULT_RETRY_CAP,
+    DEFAULT_RETRY_COUNT,
+    DEFAULT_SOCKET_CONNECT_TIMEOUT,
+    DEFAULT_SOCKET_READ_SIZE,
+    DEFAULT_SOCKET_TIMEOUT,
+)
 from redis._parsers.encoders import Encoder
 from redis._parsers.helpers import bool_ok, get_response_callbacks
 from redis.backoff import ExponentialWithJitterBackoff
@@ -54,6 +64,7 @@ from redis.exceptions import (
     ResponseError,
     WatchError,
 )
+from redis.himport import HImportRegistry, parse_himport_set_args
 from redis.lock import Lock
 from redis.maint_notifications import (
     MaintNotificationsConfig,
@@ -66,12 +77,18 @@ from redis.observability.recorder import (
     record_pubsub_message,
 )
 from redis.retry import Retry
-from redis.typing import ChannelT, PubSubHandler, Subscription
+from redis.typing import (
+    ChannelT,
+    FieldT,
+    PubSubHandler,
+    Subscription,
+)
 from redis.utils import (
     SENTINEL,
     _set_info_logger,
     check_protocol_version,
     deprecated_args,
+    experimental_method,
     safe_str,
     str_if_bytes,
     truncate_text,
@@ -214,6 +231,23 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         Return a Redis client from the given connection pool.
         The Redis client will take ownership of the connection pool and
         close it when the Redis client is closed.
+
+        Because the client closes (disconnects all connections in) the pool
+        when it is closed or garbage-collected, the pool must not be shared
+        with other clients. Constructing multiple clients from the same pool
+        via ``from_pool`` -- for example one per request across threads -- is
+        not thread safe: when one client is closed it will disconnect
+        connections still in use by the others.
+
+        To share a single pool across clients, construct the pool explicitly
+        and manage its lifecycle instead. Unlike ``from_pool``, the plain
+        ``Redis(connection_pool=pool)`` constructor does not take ownership of
+        the pool and will not close it, so a pool created this way can be
+        safely shared across clients. ``ConnectionPool`` supports the context
+        manager protocol for this::
+
+            with ConnectionPool.from_url(url) as pool:
+                r = Redis(connection_pool=pool)
         """
         client = cls(
             connection_pool=connection_pool,
@@ -236,57 +270,60 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
         host: str = "localhost",
         port: int = 6379,
         db: int = 0,
-        password: Optional[str] = None,
-        socket_timeout: Optional[float] = None,
-        socket_connect_timeout: Optional[float] = None,
-        socket_keepalive: Optional[bool] = None,
-        socket_keepalive_options: Optional[Mapping[int, Union[int, bytes]]] = None,
-        connection_pool: Optional[ConnectionPool] = None,
-        unix_socket_path: Optional[str] = None,
+        password: str | None = None,
+        socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
+        socket_connect_timeout: float | None = DEFAULT_SOCKET_CONNECT_TIMEOUT,
+        socket_read_size: int = DEFAULT_SOCKET_READ_SIZE,
+        socket_keepalive: bool | None = True,
+        socket_keepalive_options: Mapping[int, int | bytes] | object | None = SENTINEL,
+        connection_pool: ConnectionPool | None = None,
+        unix_socket_path: str | None = None,
         encoding: str = "utf-8",
         encoding_errors: str = "strict",
         decode_responses: bool = False,
         retry_on_timeout: bool = False,
         retry: Retry = Retry(
-            backoff=ExponentialWithJitterBackoff(base=1, cap=10), retries=3
+            backoff=ExponentialWithJitterBackoff(
+                base=DEFAULT_RETRY_BASE, cap=DEFAULT_RETRY_CAP
+            ),
+            retries=DEFAULT_RETRY_COUNT,
         ),
-        retry_on_error: Optional[List[Type[Exception]]] = None,
+        retry_on_error: List[Type[Exception]] | None = None,
         ssl: bool = False,
-        ssl_keyfile: Optional[str] = None,
-        ssl_certfile: Optional[str] = None,
-        ssl_cert_reqs: Union[str, "ssl.VerifyMode"] = "required",
-        ssl_include_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
-        ssl_exclude_verify_flags: Optional[List["ssl.VerifyFlags"]] = None,
-        ssl_ca_certs: Optional[str] = None,
-        ssl_ca_path: Optional[str] = None,
-        ssl_ca_data: Optional[str] = None,
+        ssl_keyfile: str | None = None,
+        ssl_certfile: str | None = None,
+        ssl_cert_reqs: "str | ssl.VerifyMode" = "required",
+        ssl_include_verify_flags: List["ssl.VerifyFlags"] | None = None,
+        ssl_exclude_verify_flags: List["ssl.VerifyFlags"] | None = None,
+        ssl_ca_certs: str | None = None,
+        ssl_ca_path: str | None = None,
+        ssl_ca_data: str | None = None,
         ssl_check_hostname: bool = True,
-        ssl_password: Optional[str] = None,
+        ssl_password: str | None = None,
         ssl_validate_ocsp: bool = False,
         ssl_validate_ocsp_stapled: bool = False,
-        ssl_ocsp_context: Optional["OpenSSL.SSL.Context"] = None,
-        ssl_ocsp_expected_cert: Optional[str] = None,
-        ssl_min_version: Optional["ssl.TLSVersion"] = None,
-        ssl_ciphers: Optional[str] = None,
-        max_connections: Optional[int] = None,
+        ssl_ocsp_context: "OpenSSL.SSL.Context | None" = None,
+        ssl_ocsp_expected_cert: str | None = None,
+        ssl_min_version: "ssl.TLSVersion | None" = None,
+        ssl_ciphers: str | None = None,
+        max_connections: int | None = None,
         single_connection_client: bool = False,
         health_check_interval: int = 0,
-        client_name: Optional[str] = None,
-        lib_name: Union[Optional[str], object] = SENTINEL,
-        lib_version: Union[Optional[str], object] = SENTINEL,
-        driver_info: Union[Optional["DriverInfo"], object] = SENTINEL,
-        username: Optional[str] = None,
-        redis_connect_func: Optional[Callable[[], None]] = None,
-        credential_provider: Optional[CredentialProvider] = None,
-        protocol: Optional[int] = None,
+        client_name: str | None = None,
+        lib_name: str | object | None = SENTINEL,
+        lib_version: str | object | None = SENTINEL,
+        driver_info: DriverInfo | object | None = SENTINEL,
+        username: str | None = None,
+        redis_connect_func: Callable[[], None] | None = None,
+        credential_provider: CredentialProvider | None = None,
+        protocol: int | None = None,
         legacy_responses: bool = True,
-        cache: Optional[CacheInterface] = None,
-        cache_config: Optional[CacheConfig] = None,
-        event_dispatcher: Optional[EventDispatcher] = None,
-        maint_notifications_config: Optional[MaintNotificationsConfig] = None,
-        oss_cluster_maint_notifications_handler: Optional[
-            OSSMaintNotificationsHandler
-        ] = None,
+        cache: CacheInterface | None = None,
+        cache_config: CacheConfig | None = None,
+        event_dispatcher: EventDispatcher | None = None,
+        maint_notifications_config: MaintNotificationsConfig | None = None,
+        oss_cluster_maint_notifications_handler: OSSMaintNotificationsHandler
+        | None = None,
     ) -> None:
         """
         Initialize a new Redis client.
@@ -311,6 +348,17 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
 
         Args:
 
+        socket_keepalive:
+            if `True`, TCP keepalive is enabled for TCP socket connections.
+            Argument is ignored when connection_pool is provided.
+        socket_keepalive_options:
+            mapping of TCP keepalive socket option constants to values, for
+            example `{socket.TCP_KEEPIDLE: 30}`. If left unspecified, redis-py
+            uses TCP keepalive defaults when `socket_keepalive` is enabled:
+            idle 30 seconds, interval 5 seconds, and 3 probes. Platform-specific
+            options that are not available are skipped. Pass `None` or `{}` to
+            avoid setting additional TCP keepalive options. Argument is ignored
+            when connection_pool is provided.
         single_connection_client:
             if `True`, connection pool is not used. In that case `Redis`
             instance use is not thread safe.
@@ -359,6 +407,7 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
                 "username": username,
                 "password": password,
                 "socket_timeout": socket_timeout,
+                "socket_read_size": socket_read_size,
                 "encoding": encoding,
                 "encoding_errors": encoding_errors,
                 "decode_responses": decode_responses,
@@ -375,10 +424,21 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             }
             # based on input, setup appropriate connection args
             if unix_socket_path is not None:
+                if (
+                    maint_notifications_config
+                    and maint_notifications_config.enabled is True
+                ):
+                    raise RedisError(
+                        "Maintenance notifications are not supported with Unix "
+                        "domain socket connections"
+                    )
                 kwargs.update(
                     {
                         "path": unix_socket_path,
                         "connection_class": UnixDomainSocketConnection,
+                        "maint_notifications_config": MaintNotificationsConfig(
+                            enabled=False
+                        ),
                     }
                 )
             else:
@@ -497,6 +557,15 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
     def get_connection_kwargs(self) -> Dict:
         """Get the connection's key-word arguments"""
         return self.connection_pool.connection_kwargs
+
+    @property
+    def himport_registry(self) -> HImportRegistry:
+        """The client's HIMPORT fieldset registry (contains empty
+        schema registry if none was declared).
+
+        Read-only: the registry is mutated only through the HIMPORT command methods.
+        """
+        return self.connection_pool.himport_registry
 
     def get_retry(self) -> Optional[Retry]:
         return self.get_connection_kwargs().get("retry")
@@ -720,14 +789,48 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             self.connection_pool.release(conn)
 
         if self.auto_close_connection_pool:
-            self.connection_pool.disconnect()
+            self.connection_pool.close()
 
     def _send_command_parse_response(self, conn, command_name, *args, **options):
         """
         Send a command and parse the response
         """
+        # HIMPORT SET is the one command whose wire form depends on per-connection
+        # state: the fieldset must be PREPAREd on this connection first, and any
+        # fieldset discarded since this connection last reconciled must be dropped.
+        # Handling it here (rather than in himport_set) lets himport_set reuse the
+        # full execute_command machinery — retry, disconnect-on-error, pooling — so
+        # a failed HIMPORT SET disconnects the connection like any other command.
+        # This per-command branch in the hot dispatch path is deliberate and has no
+        # cleaner alternative: this is the only seam where the concrete borrowed
+        # connection is known, and connection-scoped session setup can only happen
+        # once that connection is chosen. The overhead is one string compare per
+        # command.
+        himport_set = parse_himport_set_args(args)
+        if himport_set is not None:
+            # ``args`` is an HIMPORT SET in either the joined ("HIMPORT SET", key,
+            # ...) or split ("HIMPORT", "SET", key, ...) raw form; the operands come
+            # back at the right offsets for the form. A command with too few operands
+            # returns None and falls through to the normal send path so the server
+            # returns its arity error instead of a client-side IndexError here.
+            key, fieldset_name, values = himport_set
+            return self._himport_execute_set(conn, key, fieldset_name, values)
         conn.send_command(*args, **options)
         return self.parse_response(conn, command_name, **options)
+
+    def _himport_reconcile_discards(self, conn):
+        """Delegate to the shared sync HIMPORT executor."""
+        return _himport_exec.reconcile_discards(self, conn)
+
+    def _himport_prepare_and_set(self, conn, key, fieldset_name, values, fieldset):
+        """Delegate to the shared sync HIMPORT executor."""
+        return _himport_exec.prepare_and_set(
+            self, conn, key, fieldset_name, values, fieldset
+        )
+
+    def _himport_execute_set(self, conn, key, fieldset_name, values):
+        """Delegate to the shared sync HIMPORT executor."""
+        return _himport_exec.execute_set(self, conn, key, fieldset_name, values)
 
     def _close_connection(
         self,
@@ -812,32 +915,38 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
             raise
 
         finally:
-            if conn and conn.should_reconnect():
-                self._close_connection(conn)
-                conn.connect()
-            if self._single_connection_client:
-                self.single_connection_lock.release()
-            if not self.connection:
-                pool.release(conn)
+            try:
+                if conn and conn.should_reconnect():
+                    self._close_connection(conn)
+                    conn.connect()
+            finally:
+                if self._single_connection_client:
+                    self.single_connection_lock.release()
+                if not self.connection:
+                    pool.release(conn)
 
     def parse_response(self, connection, command_name, **options):
         """Parses a response from the Redis server"""
-        try:
-            if NEVER_DECODE in options:
-                response = connection.read_response(disable_decoding=True)
-                options.pop(NEVER_DECODE)
-            else:
-                response = connection.read_response()
-        except ResponseError:
+        if not options:
+            # Fast-path for the common case of no options
+            response = connection.read_response()
+        else:
+            try:
+                if NEVER_DECODE in options:
+                    response = connection.read_response(disable_decoding=True)
+                    options.pop(NEVER_DECODE)
+                else:
+                    response = connection.read_response()
+            except ResponseError:
+                if EMPTY_RESPONSE in options:
+                    return options[EMPTY_RESPONSE]
+                raise
+
             if EMPTY_RESPONSE in options:
-                return options[EMPTY_RESPONSE]
-            raise
+                options.pop(EMPTY_RESPONSE)
 
-        if EMPTY_RESPONSE in options:
-            options.pop(EMPTY_RESPONSE)
-
-        # Remove keys entry, it needs only for cache.
-        options.pop("keys", None)
+            # Remove keys entry, it needs only for cache.
+            options.pop("keys", None)
 
         if command_name in self.response_callbacks:
             return self.response_callbacks[command_name](response, **options)
@@ -845,6 +954,67 @@ class Redis(RedisModuleCommands, CoreCommands, SentinelCommands):
 
     def get_cache(self) -> Optional[CacheInterface]:
         return self.connection_pool.cache
+
+    # HIMPORT orchestration. The registry lives on the shared HImportRegistry; the
+    # server-side effect is applied lazily per connection (PREPARE bundled into the
+    # first himport_set; DISCARD reconciled when a connection is next borrowed for a
+    # himport_set). The connection carries the per-connection HIMPORT state; a
+    # CacheProxyConnection transparently delegates it to the wrapped connection, so
+    # this code never needs to know which connection type it holds.
+
+    @experimental_method()
+    def himport_prepare(self, fieldset_name: str, fields: Iterable[FieldT]) -> bool:
+        """Declare an HIMPORT fieldset for use by :meth:`himport_set`.
+
+        Registers ``fieldset_name`` (ordered ``fields``, verbatim) in the client's
+        shared registry. On a pooled client the server-side ``PREPARE`` is deferred
+        and bundled into the next ``himport_set`` per connection. On a single
+        connection client it is run immediately when the pinned connection is live;
+        while that connection is not connected there is no session state to prepare,
+        so the next ``himport_set`` prepares it lazily instead.
+        """
+        fieldset = self.himport_registry.prepare(fieldset_name, fields)
+        conn = self.connection
+        if self._single_connection_client and conn is not None and conn.is_connected:
+            self.himport_prepare_internal(fieldset_name, fieldset.fields)
+            conn._himport_prepared[fieldset_name] = fieldset.version
+        return True
+
+    @experimental_method()
+    def himport_discard(self, fieldset_name: str) -> int:
+        """Remove a fieldset from the registry.
+
+        Returns ``1`` if it was registered, ``0`` otherwise. On a pooled client the
+        server-side ``DISCARD`` is reconciled lazily when each connection is next
+        used for ``himport_set``. On a single connection client it runs immediately
+        on the pinned connection when it is live; while that connection is not
+        connected there is nothing prepared on the server to discard (its tracking is
+        reset on connect), so no server call is made.
+        """
+        removed = self.himport_registry.discard(fieldset_name)
+        conn = self.connection
+        if self._single_connection_client and conn is not None and conn.is_connected:
+            if removed:
+                self.himport_discard_internal(fieldset_name)
+            conn._himport_prepared.pop(fieldset_name, None)
+            conn._himport_reconciled_revision = self.himport_registry.revision
+        return 1 if removed else 0
+
+    @experimental_method()
+    def himport_discard_all(self) -> int:
+        """Remove all fieldsets from the registry.
+
+        Returns the number removed from the registry. Server-side removal follows the
+        same live/lazy rule as :meth:`himport_discard`.
+        """
+        count = self.himport_registry.discard_all()
+        conn = self.connection
+        if self._single_connection_client and conn is not None and conn.is_connected:
+            if count:
+                self.himport_discard_all_internal()
+            conn._himport_prepared.clear()
+            conn._himport_reconciled_revision = self.himport_registry.revision
+        return count
 
 
 StrictRedis = Redis
@@ -1221,7 +1391,11 @@ class PubSub:
                 read_timeout = timeout
             else:
                 conn.connect()
-                read_timeout = SENTINEL  # Use default socket timeout for blocking
+                # Block indefinitely waiting for a pubsub message. timeout=None
+                # makes the socket layer call sock.settimeout(None) for this read
+                # (and restore the original socket_timeout afterwards), so the
+                # configured socket_timeout does not abort the read.
+                read_timeout = None
             return conn.read_response(
                 disconnect_on_error=False, push_request=True, timeout=read_timeout
             )
@@ -1838,9 +2012,16 @@ class Pipeline(Redis):
         self.command_stack.append((args, options))
         return self
 
+    def _himport_prepare_pipeline(self, conn, commands):
+        """Delegate to the shared sync HIMPORT executor."""
+        _himport_exec.prepare_pipeline(self, conn, [args for args, _ in commands])
+
     def _execute_transaction(
         self, connection: Connection, commands, raise_on_error
     ) -> List:
+        # Ensure fieldsets referenced by buffered HIMPORT SETs are prepared on this
+        # connection before the MULTI/EXEC block (session state, not transactional).
+        self._himport_prepare_pipeline(connection, commands)
         cmds = chain([(("MULTI",), {})], commands, [(("EXEC",), {})])
         all_cmds = connection.pack_commands(
             [args for args, options in cmds if EMPTY_RESPONSE not in options]
@@ -1911,9 +2092,24 @@ class Pipeline(Redis):
         return data
 
     def _execute_pipeline(self, connection, commands, raise_on_error):
+        # Fold any first-use HIMPORT PREPAREs for referenced fieldsets into the same
+        # packed write as the queued commands, so a pipeline that lands on a fresh or
+        # reconnected connection stays a single round trip (the batched write bypasses
+        # the per-command lazy PREPARE path). Deferred-discard reconciliation happens
+        # inside pipeline_prepares and only touches the socket when discards are
+        # actually pending.
+        fieldsets = _himport_exec.pipeline_prepares(
+            self, connection, [args for args, _ in commands]
+        )
+        preflight = _himport_exec.prepare_wire_commands(fieldsets)
         # build up all commands into a single request to increase network perf
-        all_cmds = connection.pack_commands([args for args, _ in commands])
+        all_cmds = connection.pack_commands(preflight + [args for args, _ in commands])
         connection.send_packed_command(all_cmds)
+
+        # Drain the leading PREPARE replies (bookkeeping + capture the first error)
+        # before the queued replies. Everything on the wire is read before raising so
+        # the pooled socket never desyncs.
+        prep_error = _himport_exec.drain_pipeline_prepares(self, connection, fieldsets)
 
         responses = []
         for args, options in commands:
@@ -1922,6 +2118,11 @@ class Pipeline(Redis):
             except ResponseError as e:
                 responses.append(e)
 
+        # A PREPARE failure (rare: an invalid fieldset definition) is a hard error,
+        # raised regardless of raise_on_error as it was before folding -- only now
+        # every reply has already been drained.
+        if prep_error is not None:
+            raise prep_error
         if raise_on_error:
             self.raise_first_error(commands, responses)
 

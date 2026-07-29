@@ -12,7 +12,12 @@ import pytest
 import pytest_asyncio
 from _pytest.fixtures import FixtureRequest
 from redis._parsers import AsyncCommandsParser
-from redis.asyncio.cluster import ClusterNode, NodesManager, RedisCluster
+from redis.asyncio.cluster import (
+    ClusterNode,
+    NodesManager,
+    PipelineCommand,
+    RedisCluster,
+)
 from redis.asyncio.connection import Connection, SSLConnection, async_timeout
 from redis.asyncio.retry import Retry
 from redis.backoff import (
@@ -46,6 +51,7 @@ from redis.exceptions import (
     RedisError,
     ResponseError,
 )
+from redis.himport import HIMPORT_SET
 from redis.utils import str_if_bytes
 from tests.conftest import (
     assert_resp_response,
@@ -433,8 +439,10 @@ class TestRedisClusterObj:
             host = rc_default.get_default_node().host
 
             assert isinstance(retry, Retry)
-            assert retry._retries == 3
+            assert retry._retries == 10
             assert isinstance(retry._backoff, type(ExponentialWithJitterBackoff()))
+            assert retry._backoff._base == 0.01
+            assert retry._backoff._cap == 1
 
             # validate nodes connections are using the default retry for
             # lower level connections when client is created through 'from_url' method
@@ -648,6 +656,60 @@ class TestRedisClusterObj:
             execute_command.side_effect = ask_redirect_effect
 
             assert await r.execute_command("SET", "foo", "bar") == "MOCK_OK"
+
+    async def test_himport_set_moved_after_ask_uses_moved_target(
+        self, r: RedisCluster
+    ) -> None:
+        """An HIMPORT SET that is ASK-redirected and then hits a MOVED
+        mid-exchange must retry against the MOVED target, not the stale ASK
+        target.
+
+        HIMPORT SET folds the ASK allowance into its own packed write, so the
+        retry loop must clear ``asking`` before the exchange runs; otherwise a
+        MOVED raised mid-exchange would leave ``asking`` set and shadow the
+        moved-retry branch on the next iteration.
+        """
+        key = "himport:key"
+        slot = r.keyslot(key)
+        primary = r.nodes_manager.get_node_from_slot(slot)
+        others = [n for n in r.get_primaries() if n.name != primary.name]
+        if len(others) < 2:
+            pytest.skip("requires at least 3 primaries")
+        ask_node, moved_node = others[0], others[1]
+
+        calls = []
+
+        def himport_effect(self, *args, **kwargs):
+            calls.append((self.host, self.port))
+            if len(calls) == 1:
+                raise AskError(f"{slot} {ask_node.host}:{ask_node.port}")
+            if len(calls) == 2:
+                raise MovedError(f"{slot} {moved_node.host}:{moved_node.port}")
+            return "MOCK_OK"
+
+        # ``_determine_slot`` parses HIMPORT SET keys via COMMAND INFO, which the
+        # test server may not know; pin it so the moved branch can recompute the
+        # target without a live HIMPORT-capable server.
+        with (
+            mock.patch.object(
+                RedisCluster, "_determine_slot", new=mock.AsyncMock(return_value=slot)
+            ),
+            mock.patch.object(
+                ClusterNode,
+                "execute_command",
+                autospec=True,
+                side_effect=himport_effect,
+            ),
+        ):
+            assert (
+                await r._execute_command(primary, HIMPORT_SET, key, "shared", "alice")
+                == "MOCK_OK"
+            )
+
+        assert calls[0] == (primary.host, primary.port)
+        assert calls[1] == (ask_node.host, ask_node.port)
+        # Third attempt must follow the MOVED redirect, not the stale ASK target.
+        assert calls[2] == (moved_node.host, moved_node.port)
 
     async def test_moved_redirection(
         self, create_redis: Callable[..., RedisCluster]
@@ -1838,6 +1900,36 @@ class TestClusterRedisCommands:
         await r.rpush("{foo}a", "one", "two", "three", "four")
         assert await r.blmove("{foo}a", "{foo}b", 5)
         assert await r.blmove("{foo}a", "{foo}b", 1, "RIGHT", "LEFT")
+
+    @skip_if_server_version_lt("8.9.0")
+    async def test_cluster_lmovem(self, r: RedisCluster) -> None:
+        # source and destination collocated on the same slot via a hash tag
+        await r.rpush("{foo}a", "1", "2", "3", "4", "5")
+        assert await r.lmovem("{foo}a", "{foo}b") == [b"1"]
+        assert await r.lmovem(
+            "{foo}a", "{foo}b", "LEFT", "LEFT", count=3, ordering="BULK"
+        ) == [b"2", b"3", b"4"]
+
+    @skip_if_server_version_lt("8.9.0")
+    async def test_cluster_lmovem_crossslot(self, r: RedisCluster) -> None:
+        # source and destination on different slots -> cannot be dispatched
+        with pytest.raises(RedisClusterException) as ex:
+            await r.lmovem("a", "b", "LEFT", "RIGHT", count=2, ordering="BULK")
+        assert "all keys must map to the same key slot" in str(ex.value)
+
+    @skip_if_server_version_lt("8.9.0")
+    async def test_cluster_blmovem(self, r: RedisCluster) -> None:
+        await r.rpush("{foo}a", "1", "2", "3", "4", "5")
+        assert await r.blmovem("{foo}a", "{foo}b", 1) == [b"1"]
+        assert await r.blmovem(
+            "{foo}a", "{foo}b", 1, "LEFT", "LEFT", count=3, ordering="BULK"
+        ) == [b"2", b"3", b"4"]
+
+    @skip_if_server_version_lt("8.9.0")
+    async def test_cluster_blmovem_crossslot(self, r: RedisCluster) -> None:
+        with pytest.raises(RedisClusterException) as ex:
+            await r.blmovem("a", "b", 1, "LEFT", "RIGHT", count=2, ordering="BULK")
+        assert "all keys must map to the same key slot" in str(ex.value)
 
     async def test_cluster_msetnx(self, r: RedisCluster) -> None:
         d = {"{foo}a": b"1", "{foo}b": b"2", "{foo}c": b"3"}
@@ -3305,6 +3397,125 @@ class TestNodesManager:
 class TestClusterNodeConnectionHandling:
     """Tests for ClusterNode connection handling methods."""
 
+    class WriteFailingConnection:
+        def __init__(self, **kwargs: Any) -> None:
+            self.host = kwargs["host"]
+            self.port = kwargs["port"]
+            self.db = kwargs.get("db", 0)
+            self.is_connected = False
+            self.send_count = 0
+
+        def should_reconnect(self) -> bool:
+            return False
+
+        async def disconnect(self) -> None:
+            self.is_connected = False
+
+        def pack_command(self, *args: Any) -> bytes:
+            return b"packed-command"
+
+        def pack_commands(self, commands: Any) -> List[bytes]:
+            list(commands)
+            return [b"packed-commands"]
+
+        async def send_packed_command(self, command: Any) -> None:
+            self.send_count += 1
+            raise ConnectionError("simulated write failure")
+
+    async def test_execute_command_releases_connection_after_send_error(self) -> None:
+        node = ClusterNode(
+            default_host,
+            7000,
+            max_connections=1,
+            connection_class=self.WriteFailingConnection,
+        )
+
+        with pytest.raises(ConnectionError, match="simulated write failure"):
+            await node.execute_command("GET", "key")
+
+        assert len(node._connections) == 1
+        assert len(node._free) == 1
+        connection = node._connections[0]
+        assert node._free[0] is connection
+
+        with pytest.raises(ConnectionError, match="simulated write failure"):
+            await node.execute_command("GET", "key")
+
+        assert len(node._connections) == 1
+        assert len(node._free) == 1
+        assert node._free[0] is connection
+        assert connection.send_count == 2
+
+    async def test_execute_pipeline_releases_connection_after_send_error(self) -> None:
+        node = ClusterNode(
+            default_host,
+            7000,
+            max_connections=1,
+            connection_class=self.WriteFailingConnection,
+        )
+
+        with pytest.raises(ConnectionError, match="simulated write failure"):
+            await node.execute_pipeline([PipelineCommand(0, "GET", "key")])
+
+        assert len(node._connections) == 1
+        assert len(node._free) == 1
+        connection = node._connections[0]
+        assert node._free[0] is connection
+
+        with pytest.raises(ConnectionError, match="simulated write failure"):
+            await node.execute_pipeline([PipelineCommand(0, "GET", "key")])
+
+        assert len(node._connections) == 1
+        assert len(node._free) == 1
+        assert node._free[0] is connection
+        assert connection.send_count == 2
+
+    async def test_execute_command_releases_connection_after_disconnect_error(
+        self,
+    ) -> None:
+        node = ClusterNode(
+            default_host,
+            7000,
+            max_connections=1,
+            connection_class=self.WriteFailingConnection,
+        )
+
+        with mock.patch.object(
+            ClusterNode,
+            "disconnect_if_needed",
+            autospec=True,
+            side_effect=ConnectionError("simulated disconnect failure"),
+        ):
+            with pytest.raises(ConnectionError, match="simulated disconnect failure"):
+                await node.execute_command("GET", "key")
+
+        assert len(node._connections) == 1
+        assert len(node._free) == 1
+        assert node._free[0] is node._connections[0]
+
+    async def test_execute_pipeline_releases_connection_after_disconnect_error(
+        self,
+    ) -> None:
+        node = ClusterNode(
+            default_host,
+            7000,
+            max_connections=1,
+            connection_class=self.WriteFailingConnection,
+        )
+
+        with mock.patch.object(
+            ClusterNode,
+            "disconnect_if_needed",
+            autospec=True,
+            side_effect=ConnectionError("simulated disconnect failure"),
+        ):
+            with pytest.raises(ConnectionError, match="simulated disconnect failure"):
+                await node.execute_pipeline([PipelineCommand(0, "GET", "key")])
+
+        assert len(node._connections) == 1
+        assert len(node._free) == 1
+        assert node._free[0] is node._connections[0]
+
     async def test_update_active_connections_for_reconnect(self) -> None:
         """
         Test that update_active_connections_for_reconnect marks in-use connections.
@@ -3969,8 +4180,11 @@ class TestClusterPipeline:
                         break
             assert executed_on_replicas_only
 
-    async def test_can_run_concurrent_pipelines(self, r: RedisCluster) -> None:
+    async def test_can_run_concurrent_pipelines(
+        self, create_redis: Callable[..., RedisCluster]
+    ) -> None:
         """Test that the pipeline can be used concurrently."""
+        r = await create_redis(max_connections=1000)
         await asyncio.gather(
             *(self.test_redis_cluster_pipeline(r) for i in range(100)),
             *(self.test_multi_key_operation_with_a_single_slot(r) for i in range(100)),

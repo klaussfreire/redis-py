@@ -100,6 +100,25 @@ class TestConnectionPool:
         assert isinstance(connection, DummyConnection)
         assert_kwargs_subset(connection.kwargs, connection_kwargs)
 
+    def test_custom_connection_disables_maint_notifications(self):
+        pool = redis.ConnectionPool(connection_class=DummyConnection)
+
+        assert pool.maint_notifications_enabled() is None
+        assert "maint_notifications_config" not in pool.connection_kwargs
+        assert "maint_notifications_pool_handler" not in pool.connection_kwargs
+
+    def test_custom_connection_rejects_enabled_maint_notifications_config(self):
+        with pytest.raises(
+            redis.RedisError,
+            match=(
+                "Maintenance notifications are not supported with .*DummyConnection"
+            ),
+        ):
+            redis.ConnectionPool(
+                connection_class=DummyConnection,
+                maint_notifications_config=MaintNotificationsConfig(enabled=True),
+            )
+
     @pytest.mark.fixed_client
     def test_closing(self):
         connection_kwargs = {"foo": "bar", "biz": "baz"}
@@ -189,6 +208,18 @@ class TestConnectionPool:
         conn.connect()
         pool.disconnect(inuse_connections=False)
         assert conn._sock
+
+    def test_pool_context_manager(self):
+        pool = self.get_pool(connection_class=DummyConnection)
+
+        with pool as entered:
+            assert entered is pool
+            conn = pool.get_connection()
+            conn.connect()
+            assert conn._sock is not None
+
+        # exiting the context closes the pool, disconnecting all connections
+        assert conn._sock is None
 
 
 class TestBlockingConnectionPool:
@@ -339,6 +370,18 @@ class TestBlockingConnectionPool:
         pool.disconnect(inuse_connections=False)
         assert conn._sock
 
+    def test_pool_context_manager(self):
+        pool = self.get_pool()
+
+        with pool as entered:
+            assert entered is pool
+            conn = pool.get_connection()
+            conn.connect()
+            assert conn._sock is not None
+
+        # exiting the context closes the pool, disconnecting all connections
+        assert conn._sock is None
+
 
 @pytest.mark.fixed_client
 class TestConnectionPoolURLParsing:
@@ -472,6 +515,21 @@ class TestConnectionPoolURLParsing:
         pool = redis.ConnectionPool.from_url("redis://location?client_name=test-client")
         assert pool.connection_kwargs["client_name"] == "test-client"
 
+    def test_querystring_value_percent_decoded_once(self):
+        # A single percent-encoded sequence is decoded exactly once.
+        pool = redis.ConnectionPool.from_url(
+            "redis://location?client_name=worker%20name"
+        )
+        assert pool.connection_kwargs["client_name"] == "worker name"
+
+    def test_querystring_value_not_double_percent_decoded(self):
+        # A literal percent sign in a query value (encoded as %2520) must survive
+        # as "%20" rather than being decoded a second time into a space. See #4208.
+        pool = redis.ConnectionPool.from_url(
+            "redis://location?client_name=worker%2520name"
+        )
+        assert pool.connection_kwargs["client_name"] == "worker%20name"
+
     def test_invalid_extra_typed_querystring_options(self):
         with pytest.raises(ValueError):
             redis.ConnectionPool.from_url(
@@ -589,6 +647,128 @@ class TestConnectionPoolUnixSocketURLParsing:
         pool = redis.ConnectionPool.from_url("unix:///socket")
         assert pool.connection_class == redis.UnixDomainSocketConnection
         assert_kwargs_subset(pool.connection_kwargs, {"path": "/socket"})
+
+    def test_client_disables_maint_notifications(self):
+        client = redis.Redis(unix_socket_path="/socket")
+        pool = client.connection_pool
+
+        assert pool.connection_class == redis.UnixDomainSocketConnection
+        assert_kwargs_subset(pool.connection_kwargs, {"path": "/socket"})
+        assert pool.maint_notifications_enabled() is None
+        assert "maint_notifications_config" not in pool.connection_kwargs
+        assert "maint_notifications_pool_handler" not in pool.connection_kwargs
+
+    def test_client_respects_disabled_maint_notifications_config(self):
+        client = redis.Redis(
+            unix_socket_path="/socket",
+            maint_notifications_config=MaintNotificationsConfig(enabled=False),
+        )
+        pool = client.connection_pool
+
+        assert pool.connection_class == redis.UnixDomainSocketConnection
+        assert_kwargs_subset(pool.connection_kwargs, {"path": "/socket"})
+        assert pool.maint_notifications_enabled() is None
+        assert pool._maint_notifications_pool_handler is None
+        # The disabled config is consumed by ConnectionPool and should not be
+        # propagated to individual Unix socket connections.
+        assert "maint_notifications_config" not in pool.connection_kwargs
+        assert "maint_notifications_pool_handler" not in pool.connection_kwargs
+
+    def test_client_rejects_enabled_maint_notifications_config(self):
+        with pytest.raises(
+            redis.RedisError,
+            match=(
+                "Maintenance notifications are not supported with Unix "
+                "domain socket connections"
+            ),
+        ):
+            redis.Redis(
+                unix_socket_path="/socket",
+                maint_notifications_config=MaintNotificationsConfig(enabled=True),
+            )
+
+    def test_pool_rejects_enabled_maint_notifications_config(self):
+        with pytest.raises(
+            redis.RedisError,
+            match=(
+                "Maintenance notifications are not supported with "
+                ".*UnixDomainSocketConnection"
+            ),
+        ):
+            redis.ConnectionPool(
+                connection_class=redis.UnixDomainSocketConnection,
+                path="/socket",
+                maint_notifications_config=MaintNotificationsConfig(enabled=True),
+            )
+
+    def test_pool_disables_default_maint_notifications(self):
+        pool = redis.ConnectionPool(
+            connection_class=redis.UnixDomainSocketConnection,
+            path="/socket",
+            protocol=3,
+        )
+
+        assert pool.connection_class == redis.UnixDomainSocketConnection
+        assert_kwargs_subset(pool.connection_kwargs, {"path": "/socket", "protocol": 3})
+        assert pool.maint_notifications_enabled() is None
+        assert pool._maint_notifications_pool_handler is None
+        assert "maint_notifications_config" not in pool.connection_kwargs
+        assert "maint_notifications_pool_handler" not in pool.connection_kwargs
+
+    def test_default_config_client_executes_commands_without_maint_notifications(self):
+        client = redis.Redis(unix_socket_path="/socket")
+        key = "redis-py:unix-socket-default-config"
+        responses = [
+            {"proto": 3},
+            b"OK",
+            b"OK",
+            b"PONG",
+            b"OK",
+            b"value",
+        ]
+        socket_mock = mock.MagicMock()
+
+        with (
+            mock.patch.object(
+                redis.UnixDomainSocketConnection, "_connect", return_value=socket_mock
+            ),
+            mock.patch.object(
+                redis.UnixDomainSocketConnection, "can_read", return_value=False
+            ),
+            mock.patch.object(
+                redis.UnixDomainSocketConnection, "send_command"
+            ) as send_command,
+            mock.patch.object(
+                redis.UnixDomainSocketConnection, "read_response", side_effect=responses
+            ),
+            mock.patch.object(
+                redis.UnixDomainSocketConnection, "_enable_maintenance_notifications"
+            ) as enable,
+        ):
+            assert client.ping() is True
+            assert client.set(key, "value") is True
+            assert client.get(key) == b"value"
+
+        client.close()
+        enable.assert_not_called()
+        sent_commands = [command.args for command in send_command.call_args_list]
+        assert ("PING",) in sent_commands
+        assert ("SET", key, "value") in sent_commands
+        assert ("GET", key) in sent_commands
+        for command in sent_commands:
+            assert command[:2] != ("CLIENT", "MAINT_NOTIFICATIONS")
+
+    def test_connection_does_not_activate_maint_notifications(self):
+        pool = redis.ConnectionPool(
+            connection_class=redis.UnixDomainSocketConnection,
+            path="/socket",
+        )
+        conn = pool.make_connection()
+
+        with mock.patch.object(conn, "_enable_maintenance_notifications") as enable:
+            conn.activate_maint_notifications_handling_if_enabled()
+
+        enable.assert_not_called()
 
     @skip_if_server_version_lt("6.0.0")
     def test_username(self):

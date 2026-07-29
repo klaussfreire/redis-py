@@ -20,6 +20,7 @@ from typing import (
     Deque,
     Dict,
     Generator,
+    Iterable,
     List,
     Literal,
     Mapping,
@@ -36,9 +37,18 @@ if TYPE_CHECKING:
         AsyncClusterKeyspaceNotifications,
     )
 
+from redis._defaults import (
+    DEFAULT_RETRY_BASE,
+    DEFAULT_RETRY_CAP,
+    DEFAULT_RETRY_COUNT,
+    DEFAULT_SOCKET_CONNECT_TIMEOUT,
+    DEFAULT_SOCKET_READ_SIZE,
+    DEFAULT_SOCKET_TIMEOUT,
+)
 from redis._parsers import AsyncCommandsParser, Encoder
 from redis._parsers.commands import CommandPolicies, RequestPolicy, ResponsePolicy
 from redis._parsers.helpers import get_response_callbacks
+from redis.asyncio import _himport_exec
 from redis.asyncio.client import PubSub, ResponseCallbackT
 from redis.asyncio.connection import (
     AbstractConnection,
@@ -48,6 +58,7 @@ from redis.asyncio.connection import (
     parse_url,
 )
 from redis.asyncio.lock import Lock
+from redis.asyncio.maint_notifications import AsyncOSSMaintNotificationsHandler
 from redis.asyncio.observability.recorder import (
     record_error_count,
     record_operation_duration,
@@ -103,10 +114,13 @@ from redis.exceptions import (
     TryAgainError,
     WatchError,
 )
+from redis.himport import HImportRegistry, parse_himport_set_args
+from redis.maint_notifications import MaintNotificationsConfig
 from redis.typing import (
     AnyKeyT,
     ChannelT,
     EncodableT,
+    FieldT,
     KeyT,
     PubSubHandler,
     Subscription,
@@ -114,8 +128,10 @@ from redis.typing import (
 from redis.utils import (
     SENTINEL,
     SSL_AVAILABLE,
+    check_protocol_version,
     deprecated_args,
     deprecated_function,
+    experimental_method,
     safe_str,
     str_if_bytes,
     truncate_text,
@@ -135,7 +151,72 @@ TargetNodesT = TypeVar(
 )
 
 
-class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommands):
+class AsyncMaintNotificationsAbstractRedisCluster:
+    """
+    Mixin for async cluster maintenance notifications handling.
+
+    Intended to be used with multiple inheritance alongside RedisCluster.
+    All logic related to cluster-level maintenance notifications is encapsulated here.
+    """
+
+    def __init__(
+        self,
+        maint_notifications_config: MaintNotificationsConfig | None,
+        **kwargs,
+    ) -> None:
+        # The RESP3 requirement is validated in RedisCluster.__init__ before the
+        # NodesManager is constructed; this mixin is only ever run from there, so
+        # the config it receives has already been validated.
+        is_protocol_supported = check_protocol_version(kwargs.get("protocol"), 3)
+
+        if maint_notifications_config is None and is_protocol_supported:
+            maint_notifications_config = MaintNotificationsConfig()
+
+        self.maint_notifications_config = maint_notifications_config
+
+        if self.maint_notifications_config and self.maint_notifications_config.enabled:
+            self._oss_cluster_maint_notifications_handler = (
+                AsyncOSSMaintNotificationsHandler(self, self.maint_notifications_config)
+            )
+            self._update_connection_kwargs_for_maint_notifications(
+                self._oss_cluster_maint_notifications_handler
+            )
+            # Connections are created lazily via ClusterNode.acquire_connection()
+            # during nodes_manager.initialize() (which runs after __init__), so
+            # injecting into the shared connection_kwargs covers nodes discovered
+            # later. Startup nodes are the exception — they were built before this
+            # runs with their own kwargs snapshot — so the helper above also
+            # updates them directly.
+        else:
+            self._oss_cluster_maint_notifications_handler = None
+
+    def _update_connection_kwargs_for_maint_notifications(
+        self,
+        oss_cluster_maint_notifications_handler: AsyncOSSMaintNotificationsHandler,
+    ) -> None:
+        maint_kwargs = {
+            "oss_cluster_maint_notifications_handler": oss_cluster_maint_notifications_handler,
+            "maint_notifications_config": oss_cluster_maint_notifications_handler.config,
+        }
+        # Shared template used for every node created from now on (e.g. nodes
+        # discovered during nodes_manager.initialize()).
+        self.nodes_manager.connection_kwargs.update(maint_kwargs)
+        # Startup nodes were constructed before this mixin ran, so each one
+        # snapshotted connection_kwargs without the handler. Their connections
+        # are created lazily, so updating their per-node kwargs now is in time —
+        # otherwise initialize() opens the topology-discovery connection (CLUSTER
+        # SLOTS) on a startup node with no push handler wired and silently drops
+        # the maintenance notifications carried on that connection.
+        for node in self.nodes_manager.startup_nodes.values():
+            node.connection_kwargs.update(maint_kwargs)
+
+
+class RedisCluster(
+    AbstractRedis,
+    AbstractRedisCluster,
+    AsyncMaintNotificationsAbstractRedisCluster,
+    AsyncRedisClusterCommands,
+):
     """
     Create a new RedisCluster client.
 
@@ -218,6 +299,16 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
         | Maximum number of connections per node. If there are no free connections & the
           maximum number of connections are already created, a
           :class:`~.MaxConnectionsError` is raised.
+    :param socket_keepalive:
+        | If ``True``, TCP keepalive is enabled for TCP socket connections.
+    :param socket_keepalive_options:
+        | Mapping of TCP keepalive socket option constants to values, for
+          example ``{socket.TCP_KEEPIDLE: 30}``. If left unspecified, redis-py
+          uses TCP keepalive defaults when ``socket_keepalive`` is enabled:
+          idle 30 seconds, interval 5 seconds, and 3 probes.
+          Platform-specific options that are not available are skipped.
+          Pass ``None`` or ``{}`` to avoid setting additional TCP keepalive
+          options.
     :param address_remap:
         | An optional callable which, when provided with an internal network
           address of a node, e.g. a `(host, port)` tuple, will return the address
@@ -276,6 +367,9 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
     __slots__ = (
         "_initialize",
         "_lock",
+        "maint_notifications_config",
+        "_oss_cluster_maint_notifications_handler",
+        "_himport_registry",
         "retry",
         "command_flags",
         "commands_parser",
@@ -309,56 +403,58 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
     )
     def __init__(
         self,
-        host: Optional[str] = None,
-        port: Union[str, int] = 6379,
+        host: str | None = None,
+        port: str | int = 6379,
         # Cluster related kwargs
-        startup_nodes: Optional[List["ClusterNode"]] = None,
+        startup_nodes: List["ClusterNode"] | None = None,
         require_full_coverage: bool = True,
         read_from_replicas: bool = False,
-        load_balancing_strategy: Optional[LoadBalancingStrategy] = None,
+        load_balancing_strategy: LoadBalancingStrategy | None = None,
         dynamic_startup_nodes: bool = True,
         reinitialize_steps: int = 5,
-        cluster_error_retry_attempts: int = 3,
-        max_connections: int = 2**31,
-        retry: Optional["Retry"] = None,
-        retry_on_error: Optional[List[Type[Exception]]] = None,
+        cluster_error_retry_attempts: int = DEFAULT_RETRY_COUNT,
+        max_connections: int = 100,
+        retry: Retry | None = None,
+        retry_on_error: List[Type[Exception]] | None = None,
         # Client related kwargs
-        db: Union[str, int] = 0,
-        path: Optional[str] = None,
-        credential_provider: Optional[CredentialProvider] = None,
-        username: Optional[str] = None,
-        password: Optional[str] = None,
-        client_name: Optional[str] = None,
-        lib_name: Union[Optional[str], object] = SENTINEL,
-        lib_version: Union[Optional[str], object] = SENTINEL,
-        driver_info: Union[Optional["DriverInfo"], object] = SENTINEL,
+        db: str | int = 0,
+        path: str | None = None,
+        credential_provider: CredentialProvider | None = None,
+        username: str | None = None,
+        password: str | None = None,
+        client_name: str | None = None,
+        lib_name: str | object | None = SENTINEL,
+        lib_version: str | object | None = SENTINEL,
+        driver_info: DriverInfo | object | None = SENTINEL,
         # Encoding related kwargs
         encoding: str = "utf-8",
         encoding_errors: str = "strict",
         decode_responses: bool = False,
         # Connection related kwargs
         health_check_interval: float = 0,
-        socket_connect_timeout: Optional[float] = None,
-        socket_keepalive: bool = False,
-        socket_keepalive_options: Optional[Mapping[int, Union[int, bytes]]] = None,
-        socket_timeout: Optional[float] = None,
+        socket_timeout: float | None = DEFAULT_SOCKET_TIMEOUT,
+        socket_connect_timeout: float | None = DEFAULT_SOCKET_CONNECT_TIMEOUT,
+        socket_read_size: int = DEFAULT_SOCKET_READ_SIZE,
+        socket_keepalive: bool = True,
+        socket_keepalive_options: Mapping[int, int | bytes] | object | None = SENTINEL,
         # SSL related kwargs
         ssl: bool = False,
-        ssl_ca_certs: Optional[str] = None,
-        ssl_ca_data: Optional[str] = None,
-        ssl_cert_reqs: Union[str, VerifyMode] = "required",
-        ssl_include_verify_flags: Optional[List[VerifyFlags]] = None,
-        ssl_exclude_verify_flags: Optional[List[VerifyFlags]] = None,
-        ssl_certfile: Optional[str] = None,
+        ssl_ca_certs: str | None = None,
+        ssl_ca_data: str | None = None,
+        ssl_cert_reqs: "str | VerifyMode" = "required",
+        ssl_include_verify_flags: List["VerifyFlags"] | None = None,
+        ssl_exclude_verify_flags: List["VerifyFlags"] | None = None,
+        ssl_certfile: str | None = None,
         ssl_check_hostname: bool = True,
-        ssl_keyfile: Optional[str] = None,
-        ssl_min_version: Optional[TLSVersion] = None,
-        ssl_ciphers: Optional[str] = None,
-        protocol: Optional[int] = None,
+        ssl_keyfile: str | None = None,
+        ssl_min_version: "TLSVersion | None" = None,
+        ssl_ciphers: str | None = None,
+        protocol: int | None = None,
         legacy_responses: bool = True,
-        address_remap: Optional[Callable[[Tuple[str, int]], Tuple[str, int]]] = None,
-        event_dispatcher: Optional[EventDispatcher] = None,
+        address_remap: Callable[[Tuple[str, int]], Tuple[str, int]] | None = None,
+        event_dispatcher: EventDispatcher | None = None,
         policy_resolver: AsyncPolicyResolver = AsyncStaticPolicyResolver(),
+        maint_notifications_config: MaintNotificationsConfig | None = None,
     ) -> None:
         if db:
             raise RedisClusterException(
@@ -399,6 +495,7 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
             "socket_connect_timeout": socket_connect_timeout,
             "socket_keepalive": socket_keepalive,
             "socket_keepalive_options": socket_keepalive_options,
+            "socket_read_size": socket_read_size,
             "socket_timeout": socket_timeout,
             "protocol": protocol,
             "legacy_responses": legacy_responses,
@@ -430,7 +527,9 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
             self.retry = retry
         else:
             self.retry = Retry(
-                backoff=ExponentialWithJitterBackoff(base=1, cap=10),
+                backoff=ExponentialWithJitterBackoff(
+                    base=DEFAULT_RETRY_BASE, cap=DEFAULT_RETRY_CAP
+                ),
                 retries=cluster_error_retry_attempts,
             )
         if retry_on_error:
@@ -450,7 +549,33 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
             )
         else:
             kwargs["response_callbacks"]["CLUSTER SHARDS"] = parse_cluster_shards
+
+        # Build the client-level HIMPORT registry once (always empty at construction)
+        # and share the same object with every node connection. It rides in
+        # connection_kwargs -> ClusterNode -> each node's Connection, so the registry is
+        # shared cluster-wide and runtime himport_prepare mutates one object. (Async has
+        # no per-node Redis client, so the object flows via connection_kwargs directly to
+        # the Connection, which is internal plumbing, not a public param.)
+        self._himport_registry = HImportRegistry()
+        kwargs["himport_registry"] = self._himport_registry
+
         self.connection_kwargs = kwargs
+
+        # Validate maint_notifications_config before NodesManager is constructed
+        # so that a bad config doesn't leak an open NodesManager.
+        if (
+            maint_notifications_config
+            and maint_notifications_config.enabled
+            and not check_protocol_version(protocol, 3)
+        ):
+            raise RedisError(
+                "Maintenance notifications are only supported with RESP version 3"
+            )
+        if check_protocol_version(protocol, 3) and maint_notifications_config is None:
+            maint_notifications_config = MaintNotificationsConfig()
+        # Initialize to None so aclose() and any error-path code never sees an
+        # unset slot, even if __init__ raises before the mixin runs.
+        self._oss_cluster_maint_notifications_handler = None
 
         if startup_nodes:
             passed_nodes = []
@@ -477,6 +602,11 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
             dynamic_startup_nodes=dynamic_startup_nodes,
             address_remap=address_remap,
             event_dispatcher=self._event_dispatcher,
+        )
+        AsyncMaintNotificationsAbstractRedisCluster.__init__(
+            self,
+            maint_notifications_config=maint_notifications_config,
+            protocol=protocol,
         )
         self.encoder = Encoder(encoding, encoding_errors, decode_responses)
         self.read_from_replicas = read_from_replicas
@@ -566,6 +696,13 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
             async with self._lock:
                 if not self._initialize:
                     self._initialize = True
+                    if self._oss_cluster_maint_notifications_handler:
+                        tasks = list(
+                            self._oss_cluster_maint_notifications_handler._background_tasks
+                        )
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
                     await self.nodes_manager.aclose()
                     await self.nodes_manager.aclose("startup_nodes")
 
@@ -761,6 +898,40 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
         See: https://redis.io/docs/manual/scaling/#redis-cluster-data-sharding
         """
         return key_slot(self.encoder.encode(key))
+
+    # HIMPORT orchestration (async mirror of redis.cluster.RedisCluster). The one
+    # shared HImportRegistry is mutated once by PREPARE/DISCARD/DISCARDALL and applied
+    # lazily per node; SET routes by key slot to the owning primary's ClusterNode.
+    # See ``.agents/himport_client_support_spec.md``.
+
+    @property
+    def himport_registry(self) -> HImportRegistry:
+        """The cluster-wide HIMPORT fieldset registry (empty if none was declared).
+
+        Read-only: the registry is mutated only through the HIMPORT command methods.
+        """
+        return self._himport_registry
+
+    @experimental_method()
+    async def himport_prepare(
+        self, fieldset_name: str, fields: Iterable[FieldT]
+    ) -> bool:
+        """Declare an HIMPORT fieldset cluster-wide (shared registry, applied lazily)."""
+        await self.initialize()
+        self._himport_registry.prepare(fieldset_name, fields)
+        return True
+
+    @experimental_method()
+    async def himport_discard(self, fieldset_name: str) -> int:
+        """Remove an HIMPORT fieldset cluster-wide (shared registry, applied lazily)."""
+        await self.initialize()
+        return 1 if self._himport_registry.discard(fieldset_name) else 0
+
+    @experimental_method()
+    async def himport_discard_all(self) -> int:
+        """Remove all HIMPORT fieldsets cluster-wide (shared registry, applied lazily)."""
+        await self.initialize()
+        return self._himport_registry.discard_all()
 
     def get_encoder(self) -> Encoder:
         """Get the encoder object of the client."""
@@ -1084,10 +1255,18 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
 
         while ttl > 0:
             ttl -= 1
+            ask_himport = False
             try:
                 if asking:
                     target_node = self.get_node(node_name=redirect_addr)
-                    await target_node.execute_command("ASKING")
+                    if parse_himport_set_args(args) is not None:
+                        # ASKING must sit on the same connection as the SET,
+                        # immediately before it. HIMPORT SET's own executor folds
+                        # ASKING into the SET's packed write after the session setup,
+                        # so don't send it here as a separately pooled command.
+                        ask_himport = True
+                    else:
+                        await target_node.execute_command("ASKING")
                     asking = False
                 elif moved:
                     # MOVED occurred and the slots cache was updated,
@@ -1102,7 +1281,9 @@ class RedisCluster(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterCommand
                     )
                     moved = False
 
-                response = await target_node.execute_command(*args, **kwargs)
+                response = await target_node.execute_command(
+                    *args, asking=ask_himport, **kwargs
+                )
                 await self._record_command_metric(
                     command_name=command,
                     duration_seconds=time.monotonic() - start_time,
@@ -1463,7 +1644,7 @@ class ClusterNode:
         port: Union[str, int],
         server_type: Optional[str] = None,
         *,
-        max_connections: int = 2**31,
+        max_connections: int = 100,
         connection_class: Type[Connection] = Connection,
         **connection_kwargs: Any,
     ) -> None:
@@ -1658,50 +1839,124 @@ class ClusterNode:
 
         return response
 
-    async def execute_command(self, *args: Any, **kwargs: Any) -> Any:
+    async def execute_command(
+        self, *args: Any, asking: bool = False, **kwargs: Any
+    ) -> Any:
         # Acquire connection
         connection = self.acquire_connection()
-        # Handle lazy disconnect for connections marked for reconnect
-        await self.disconnect_if_needed(connection)
-
-        # Execute command
-        await connection.send_packed_command(connection.pack_command(*args))
-
-        # Read response
         try:
+            # Handle lazy disconnect for connections marked for reconnect
+            await self.disconnect_if_needed(connection)
+
+            # HIMPORT SET is the one command whose wire form depends on
+            # per-connection state: the fieldset must be PREPAREd on this
+            # connection first, and any fieldset discarded since this connection
+            # last reconciled must be dropped. Doing it here (rather than in
+            # RedisCluster.himport_set) reuses the caller's full retry, MOVED/ASK
+            # and disconnect-on-error handling for HIMPORT SET too.
+            # This per-command branch in the hot dispatch path is deliberate and has
+            # no cleaner alternative: this is the only seam where the concrete routed
+            # connection is known, and connection-scoped session setup can only happen
+            # once that connection is chosen. The overhead is one comparison per
+            # command.
+            # On an ASK redirect ``asking`` is passed here rather than sent as a
+            # separate ASKING command so the allowance sits on this same connection,
+            # folded into the SET's own write immediately before the SET.
+            himport_set = parse_himport_set_args(args)
+            if himport_set is not None:
+                # HIMPORT SET in the joined ("HIMPORT SET", key, ...) or split
+                # ("HIMPORT", "SET", key, ...) raw form; operands at the right
+                # offsets. Too few operands returns None and falls through to the
+                # normal send path below so the server returns its arity error
+                # instead of a client-side IndexError.
+                key, fieldset_name, values = himport_set
+                return await self._himport_execute_set(
+                    connection, key, fieldset_name, values, asking=asking
+                )
+
+            # Execute command
+            await connection.send_packed_command(connection.pack_command(*args))
+
+            # Read response
             return await self.parse_response(connection, args[0], **kwargs)
         finally:
-            await self.disconnect_if_needed(connection)
-            # Release connection
-            self.release(connection)
+            try:
+                await self.disconnect_if_needed(connection)
+            finally:
+                # Release connection
+                self.release(connection)
+
+    async def _himport_reconcile_discards(self, conn: "Connection") -> None:
+        """Delegate to the shared async HIMPORT executor."""
+        return await _himport_exec.reconcile_discards(self, conn)
+
+    async def _himport_prepare_and_set(
+        self,
+        conn: "Connection",
+        key: KeyT,
+        fieldset_name: str,
+        values: List,
+        fieldset,
+        asking: bool = False,
+    ) -> Any:
+        """Delegate to the shared async HIMPORT executor."""
+        return await _himport_exec.prepare_and_set(
+            self, conn, key, fieldset_name, values, fieldset, asking=asking
+        )
+
+    async def _himport_execute_set(
+        self,
+        conn: "Connection",
+        key: KeyT,
+        fieldset_name: str,
+        values: List,
+        asking: bool = False,
+    ) -> Any:
+        """Delegate to the shared async HIMPORT executor."""
+        return await _himport_exec.execute_set(
+            self, conn, key, fieldset_name, values, asking=asking
+        )
+
+    async def _himport_prepare_pipeline(
+        self, conn: "Connection", commands: List["PipelineCommand"]
+    ) -> None:
+        """Delegate to the shared async HIMPORT executor."""
+        await _himport_exec.prepare_pipeline(self, conn, [cmd.args for cmd in commands])
 
     async def execute_pipeline(self, commands: List["PipelineCommand"]) -> bool:
         # Acquire connection
         connection = self.acquire_connection()
-        # Handle lazy disconnect for connections marked for reconnect
-        await self.disconnect_if_needed(connection)
+        try:
+            # Handle lazy disconnect for connections marked for reconnect
+            await self.disconnect_if_needed(connection)
 
-        # Execute command
-        await connection.send_packed_command(
-            connection.pack_commands(cmd.args for cmd in commands)
-        )
+            # PREPARE fieldsets referenced by buffered HIMPORT SETs before the
+            # batched write (it bypasses the per-command lazy prepare path).
+            await self._himport_prepare_pipeline(connection, commands)
 
-        # Read responses
-        ret = False
-        for cmd in commands:
+            # Execute command
+            await connection.send_packed_command(
+                connection.pack_commands(cmd.args for cmd in commands)
+            )
+
+            # Read responses
+            ret = False
+            for cmd in commands:
+                try:
+                    cmd.result = await self.parse_response(
+                        connection, cmd.args[0], **cmd.kwargs
+                    )
+                except Exception as e:
+                    cmd.result = e
+                    ret = True
+
+            return ret
+        finally:
             try:
-                cmd.result = await self.parse_response(
-                    connection, cmd.args[0], **cmd.kwargs
-                )
-            except Exception as e:
-                cmd.result = e
-                ret = True
-
-        # Release connection
-        await self.disconnect_if_needed(connection)
-        self.release(connection)
-
-        return ret
+                await self.disconnect_if_needed(connection)
+            finally:
+                # Release connection
+                self.release(connection)
 
     async def re_auth_callback(self, token: TokenInterface):
         tmp_queue = collections.deque()
@@ -1819,11 +2074,26 @@ class NodesManager:
 
         for name, node in new.items():
             if name in old:
-                # Preserve the existing node but mark connections for reconnect.
-                # This method is sync so we can't call disconnect_free_connections()
-                # which is async. Instead, we mark free connections for reconnect
-                # and they will be lazily disconnected when acquired via
-                # disconnect_if_needed() to avoid race conditions.
+                # Preserve the existing node but mark ALL its connections for
+                # reconnect on every topology refresh.
+                #
+                # Why recycle every preserved node's connections, not just the
+                # ones whose slots/role changed?
+                #   set_nodes only sees the old vs new node dicts; it does not
+                #   track which specific nodes had slot-ownership or role changes
+                #   during this refresh. Rather than try to diff that (and risk
+                #   serving a connection whose cached routing/READONLY state is
+                #   now stale), we conservatively refresh every preserved node.
+                #   Reconnect is lazy and cheap, so the extra churn is acceptable
+                #   in exchange for never serving a stale connection after a
+                #   topology change.
+                #
+                # Why mark-for-reconnect instead of disconnecting here?
+                #   set_nodes is sync but disconnect_free_connections() is async,
+                #   so we cannot disconnect inline. Marking both in-use and free
+                #   connections for reconnect lets them be lazily disconnected on
+                #   next acquire via disconnect_if_needed(), which avoids races.
+                #
                 # TODO: Make this method async in the next major release to allow
                 # immediate disconnection of free connections.
                 existing_node = old[name]
@@ -2234,6 +2504,33 @@ class ClusterPipeline(AbstractRedis, AbstractRedisCluster, AsyncRedisClusterComm
     def nodes_manager(self) -> "NodesManager":
         """Get the nodes manager from the cluster client."""
         return self.cluster_client.nodes_manager
+
+    # HIMPORT lifecycle on a cluster pipeline delegates to the parent client, mutating
+    # the one shared registry that every node pool references. A fieldset declared here
+    # is therefore visible to the batched himport_set pre-flight, mirroring the sync
+    # ClusterPipeline (which inherits these from RedisCluster over the shared registry).
+
+    @property
+    def himport_registry(self) -> HImportRegistry:
+        """The cluster-wide HIMPORT fieldset registry (empty if none was declared).
+
+        Read-only: the registry is mutated only through the HIMPORT command methods.
+        """
+        return self.cluster_client.himport_registry
+
+    async def himport_prepare(
+        self, fieldset_name: str, fields: Iterable[FieldT]
+    ) -> bool:
+        """Declare an HIMPORT fieldset cluster-wide (shared registry, applied lazily)."""
+        return await self.cluster_client.himport_prepare(fieldset_name, fields)
+
+    async def himport_discard(self, fieldset_name: str) -> int:
+        """Remove an HIMPORT fieldset cluster-wide (shared registry, applied lazily)."""
+        return await self.cluster_client.himport_discard(fieldset_name)
+
+    async def himport_discard_all(self) -> int:
+        """Remove all HIMPORT fieldsets cluster-wide (shared registry, applied lazily)."""
+        return await self.cluster_client.himport_discard_all()
 
     def set_response_callback(self, command: str, callback: ResponseCallbackT) -> None:
         """Set a custom response callback on the cluster client."""
@@ -2929,8 +3226,28 @@ class TransactionStrategy(AbstractStrategy):
         Send a command and parse the response
         """
 
-        await connection.send_command(*args)
-        output = await redis_node.parse_response(connection, command_name, **options)
+        # HIMPORT SET's wire form depends on per-connection state: the fieldset
+        # must be PREPAREd on this connection first, and any fieldset discarded
+        # since this connection last reconciled must be dropped. The
+        # immediate/watched path (commands issued after WATCH, before MULTI)
+        # would otherwise send a bare HIMPORT SET and fail with "no such
+        # fieldset". Route it through the node's HIMPORT executor, the same way
+        # the normal cluster path, the batched MULTI/EXEC path, and standalone
+        # watched pipelines all do.
+        himport_set = parse_himport_set_args(args)
+        if himport_set is not None:
+            # HIMPORT SET in the joined or split raw form; operands at the right
+            # offsets. Too few operands returns None and falls through to the bare
+            # send so the server returns its arity error.
+            key, fieldset_name, values = himport_set
+            output = await redis_node._himport_execute_set(
+                connection, key, fieldset_name, values
+            )
+        else:
+            await connection.send_command(*args)
+            output = await redis_node.parse_response(
+                connection, command_name, **options
+            )
 
         if command_name in self.UNWATCH_COMMANDS:
             self._watching = False
@@ -3035,6 +3352,11 @@ class TransactionStrategy(AbstractStrategy):
         # Only disconnect if not watching - disconnecting would lose WATCH state
         if not self._watching:
             await redis_node.disconnect_if_needed(connection)
+
+        # Ensure fieldsets referenced by buffered HIMPORT SETs are prepared on this
+        # node's connection before the MULTI/EXEC block (session state, not
+        # transactional). All keys share one slot here, so it is a single node.
+        await redis_node._himport_prepare_pipeline(connection, stack)
 
         stack = chain(
             [PipelineCommand(0, "MULTI")],
@@ -3143,35 +3465,50 @@ class TransactionStrategy(AbstractStrategy):
     async def reset(self):
         self._command_queue = []
 
-        # make sure to reset the connection state in the event that we were
-        # watching something
-        if self._transaction_connection:
-            try:
-                if self._watching:
-                    # call this manually since our unwatch or
-                    # immediate_execute_command methods can call reset()
-                    await self._transaction_connection.send_command("UNWATCH")
-                    await self._transaction_connection.read_response()
-                # we can safely return the connection to the pool here since we're
-                # sure we're no longer WATCHing anything
-                await self._transaction_node.disconnect_if_needed(
-                    self._transaction_connection
+        try:
+            # make sure to reset the connection state in the event that we
+            # were watching something
+            if self._transaction_connection:
+                try:
+                    if self._watching:
+                        # call this manually since our unwatch or
+                        # immediate_execute_command methods can call reset()
+                        await self._transaction_connection.send_command("UNWATCH")
+                        await self._transaction_connection.read_response()
+                except self.CONNECTION_ERRORS:
+                    # disconnect will also remove any previous WATCHes
+                    if self._transaction_connection:
+                        await self._transaction_connection.disconnect()
+                except asyncio.CancelledError:
+                    # Disconnect so any unread UNWATCH reply does not get
+                    # served to the next caller that takes the connection.
+                    if self._transaction_connection:
+                        await self._transaction_connection.disconnect()
+                    raise
+                else:
+                    # On the happy path, honor lazy reconnect before release.
+                    await self._transaction_node.disconnect_if_needed(
+                        self._transaction_connection
+                    )
+        finally:
+            # Always return the connection to the node's free queue, even on
+            # cancellation, so cancelled resets do not leak pooled
+            # connections. Detach the reference before releasing so the
+            # strategy never holds a pointer to a returned connection.
+            # ClusterNode.release is synchronous, so no shield is required.
+            if self._transaction_connection and self._transaction_node:
+                connection, self._transaction_connection = (
+                    self._transaction_connection,
+                    None,
                 )
-                self._transaction_node.release(self._transaction_connection)
-                self._transaction_connection = None
-            except self.CONNECTION_ERRORS:
-                # disconnect will also remove any previous WATCHes
-                if self._transaction_connection and self._transaction_node:
-                    await self._transaction_connection.disconnect()
-                    self._transaction_node.release(self._transaction_connection)
-                    self._transaction_connection = None
-
-        # clean up the other instance attributes
-        self._transaction_node = None
-        self._watching = False
-        self._explicit_transaction = False
-        self._pipeline_slots = set()
-        self._executing = False
+                self._transaction_node.release(connection)
+            # clean up the other instance attributes
+            self._transaction_connection = None
+            self._transaction_node = None
+            self._watching = False
+            self._explicit_transaction = False
+            self._pipeline_slots = set()
+            self._executing = False
 
     def multi(self):
         if self._explicit_transaction:
